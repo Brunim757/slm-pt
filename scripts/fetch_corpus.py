@@ -22,6 +22,7 @@ ALPACA = "dominguesm/alpaca-data-pt-br"
 ALPACA_FALLBACK = "data/train-00000-of-00001-63604ec441480f0e.parquet"
 OASST = "OpenAssistant/oasst1"
 OASST_FALLBACK = "data/train-00000-of-00001-b42a775f407cee45.parquet"
+PT_LANGS = {"pt", "pt-BR", "pt_PT", "pt-br"}
 
 
 def open_url(url, timeout=300):
@@ -216,10 +217,10 @@ def main():
                 for i in range(len(t["message_id"])):
                     if n_oas >= args.oasst_max:
                         break
-                    if t["lang"][i] != "pt" or t["role"][i] != "assistant":
+                    if t["lang"][i] not in PT_LANGS or t["role"][i] != "assistant":
                         continue
                     j = idx.get(t["parent_id"][i])
-                    if j is None or t["lang"][j] != "pt" or t["role"][j] != "prompter":
+                    if j is None or t["lang"][j] not in PT_LANGS or t["role"][j] != "prompter":
                         continue
                     q = (t["text"][j] or "").strip()
                     a = (t["text"][i] or "").strip()
