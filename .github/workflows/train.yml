@@ -1,0 +1,84 @@
+name: train
+
+on:
+  workflow_dispatch:
+    inputs:
+      steps:
+        description: "max training steps"
+        default: "20000"
+      max_minutes:
+        description: "wall-clock budget (minutes)"
+        default: "300"
+      embd:
+        description: "embedding dim"
+        default: "192"
+      layer:
+        description: "number of layers"
+        default: "4"
+      head:
+        description: "attention heads"
+        default: "6"
+      block:
+        description: "context length"
+        default: "192"
+      batch:
+        description: "batch size"
+        default: "48"
+      lr:
+        description: "learning rate"
+        default: "3e-4"
+
+permissions:
+  contents: read
+
+jobs:
+  train:
+    runs-on: ubuntu-latest
+    timeout-minutes: 355
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install toolchain
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq cmake g++ >/dev/null
+
+      - name: Fetch Portuguese corpus
+        run: python3 scripts/fetch_corpus.py --out data/corpus.txt
+
+      - name: Build
+        run: |
+          cmake -B build -DCMAKE_BUILD_TYPE=Release
+          cmake --build build -j"$(nproc)"
+
+      - name: Gradient check
+        run: ./build/slmpt_gradcheck
+
+      - name: Smoke test (fast)
+        run: |
+          mkdir -p runs
+          ./build/slmpt_train --data data/corpus.txt --out runs \
+            --embd 64 --layer 2 --head 4 --block 64 --batch 8 \
+            --steps 30 --save-every 30 --sample-every 30 --threads 4
+
+      - name: Train
+        run: |
+          ./build/slmpt_train --data data/corpus.txt --out runs \
+            --embd ${{ github.event.inputs.embd || '192' }} \
+            --layer ${{ github.event.inputs.layer || '4' }} \
+            --head ${{ github.event.inputs.head || '6' }} \
+            --block ${{ github.event.inputs.block || '192' }} \
+            --batch ${{ github.event.inputs.batch || '48' }} \
+            --lr ${{ github.event.inputs.lr || '3e-4' }} \
+            --steps ${{ github.event.inputs.steps || '20000' }} \
+            --max-minutes ${{ github.event.inputs.max_minutes || '300' }} \
+            --save-every 500 --sample-every 500 --threads "$(nproc)"
+
+      - name: Upload checkpoint + samples
+        uses: actions/upload-artifact@v4
+        with:
+          name: slm-pt-run
+          path: |
+            runs/model.bin
+            runs/samples.txt
+          if-no-files-found: warn

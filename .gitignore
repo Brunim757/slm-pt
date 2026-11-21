@@ -1,0 +1,7 @@
+build/
+runs/
+data/
+*.bin
+samples.txt
+.cache/
+__pycache__/
