@@ -3,13 +3,37 @@ on:
   workflow_dispatch:
     inputs:
       steps:
-        description: "s"
-        default: "10"
-      lr:
-        description: "l"
-        default: "3e-4"
+        description: "max training steps"
+        default: "20000"
+      max_minutes:
+        description: "wall-clock budget (minutes)"
+        default: "300"
+      embd:
+        description: "embedding dim"
+        default: "192"
+permissions:
+  contents: read
 jobs:
-  x:
+  train:
     runs-on: ubuntu-latest
+    timeout-minutes: 355
     steps:
-      - run: echo "steps=${{ github.event.inputs.steps || '1' }} lr=${{ github.event.inputs.lr || '3e-4' }}"
+      - uses: actions/checkout@v4
+      - name: Install toolchain
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq cmake g++ >/dev/null
+      - name: Train
+        run: |
+          echo "--embd ${{ github.event.inputs.embd || '192' }} \
+            --steps ${{ github.event.inputs.steps || '20000' }} \
+            --max-minutes ${{ github.event.inputs.max_minutes || '300' }} \
+            --threads \"$(nproc)\""
+      - name: Upload
+        uses: actions/upload-artifact@v4
+        with:
+          name: probe-run
+          path: |
+            runs/model.bin
+            runs/samples.txt
+          if-no-files-found: warn
