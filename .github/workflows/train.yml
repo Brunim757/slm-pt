@@ -13,20 +13,20 @@ on:
         description: "wall-clock budget (minutes)"
         default: "300"
       examples:
-        description: "corpus size limit (0 = all)"
-        default: "12000"
+        description: "alpaca pairs limit (0 = all)"
+        default: "16000"
       embd:
         description: "embedding dim"
-        default: "128"
+        default: "192"
       layer:
         description: "number of layers"
-        default: "4"
+        default: "5"
       head:
         description: "attention heads"
-        default: "4"
+        default: "6"
       block:
         description: "context length"
-        default: "128"
+        default: "192"
       batch:
         description: "batch size"
         default: "32"
@@ -92,10 +92,10 @@ jobs:
           RESUME=""
           if [ -f runs/model.bin ]; then RESUME="--resume runs/model.bin"; fi
           ./build/slmpt_train --data data/corpus.txt --out runs \
-            --embd ${{ github.event.inputs.embd || '128' }} \
-            --layer ${{ github.event.inputs.layer || '4' }} \
-            --head ${{ github.event.inputs.head || '4' }} \
-            --block ${{ github.event.inputs.block || '128' }} \
+            --embd ${{ github.event.inputs.embd || '192' }} \
+            --layer ${{ github.event.inputs.layer || '5' }} \
+            --head ${{ github.event.inputs.head || '6' }} \
+            --block ${{ github.event.inputs.block || '192' }} \
             --batch ${{ github.event.inputs.batch || '32' }} \
             --lr ${{ github.event.inputs.lr || '3e-4' }} \
             --steps ${{ github.event.inputs.steps || '100000' }} \

@@ -23,8 +23,10 @@ static const char* argval(int argc, char** argv, const char* key, const char* de
 
 int main(int argc, char** argv) {
   const std::string path = argval(argc, argv, "--model", "runs/model.bin");
-  const float temp = std::atof(argval(argc, argv, "--temp", "0.8"));
+  const float temp = std::atof(argval(argc, argv, "--temp", "0.7"));
   const int top_k = std::atoi(argval(argc, argv, "--top-k", "40"));
+  const float top_p = std::atof(argval(argc, argv, "--top-p", "0.9"));
+  const float rep = std::atof(argval(argc, argv, "--rep", "1.15"));
   const int max_new = std::atoi(argval(argc, argv, "--max-new", "240"));
   const int threads = std::atoi(
       argval(argc, argv, "--threads", "0"));
@@ -50,7 +52,10 @@ int main(int argc, char** argv) {
   SampleParams sp;
   sp.temperature = temp;
   sp.top_k = top_k;
+  sp.top_p = top_p;
+  sp.repetition_penalty = rep;
   sp.max_new = max_new;
+  sp.stop = "\n\n### Usuário:";
 
   std::string line;
   while (true) {
