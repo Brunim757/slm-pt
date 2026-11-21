@@ -58,11 +58,11 @@ void linear_bwd(const float* x, const float* W, const float* dy, float* dx,
       }
       if (dW) {
         float* dwo = dW + static_cast<size_t>(o) * in;
-        for (int i = 0; i < in; ++i) {
-          float acc = 0.f;
-          for (int r = 0; r < rows; ++r)
-            acc += dy[static_cast<size_t>(r) * out + o] * x[static_cast<size_t>(r) * in + i];
-          dwo[i] += acc;
+        for (int r = 0; r < rows; ++r) {
+          const float g = dy[static_cast<size_t>(r) * out + o];
+          if (g == 0.f) continue;
+          const float* xr = x + static_cast<size_t>(r) * in;
+          for (int i = 0; i < in; ++i) dwo[i] += g * xr[i];
         }
       }
     }
