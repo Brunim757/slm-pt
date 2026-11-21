@@ -25,6 +25,12 @@ scripts/         fetch_corpus.py (baixa corpus PT e formata o diálogo)
   warmup + cosine, checkpoints, amostras periódicas.
 * **Formato de diálogo**: `### Usuário: ... ### Assistente: ...`, para ele
   aprender a **responder**, não só a copiar texto.
+* **Dados** (`scripts/fetch_corpus.py`) misturam três fontes em português:
+  `dominguesm/alpaca-data-pt-br` (instruções), conversas humanas reais do
+  `OpenAssistant/oasst1` (só as em `pt`) e um conjunto de **small talk** escrito à
+  mão, pra "olá", "tudo bem?" etc. terem resposta decente.
+* **Decodificação**: temperatura + top-k + top-p + **penalidade de repetição** e
+  parada automática em `### Usuário:`.
 
 ## Build local
 
@@ -45,7 +51,7 @@ cmake -B build -DCMAKE_BUILD_TYPE=Release && cmake --build build -j
 ```bash
 python3 scripts/fetch_corpus.py --out data/corpus.txt   # baixa o corpus PT
 ./build/slmpt_train --data data/corpus.txt --out runs \
-  --embd 128 --layer 4 --head 4 --block 128 --batch 32 \
+  --embd 192 --layer 5 --head 6 --block 192 --batch 32 \
   --steps 100000 --max-minutes 300 --save-every 500 --sample-every 250
 ```
 
@@ -58,7 +64,7 @@ Retomar de um checkpoint:
 ## Conversar
 
 ```bash
-./build/slmpt_chat --model runs/model.bin --temp 0.8 --top-k 40
+./build/slmpt_chat --model runs/model.bin --temp 0.7 --top-k 40 --top-p 0.9 --rep 1.15
 ```
 
 ## Validar a matemática
