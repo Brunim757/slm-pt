@@ -1,3 +1,4 @@
+# Long training job (runs on GitHub-hosted runners).
 name: train
 
 on:
