@@ -92,7 +92,7 @@ int main(int argc, char** argv) {
   SampleParams sp;
   sp.temperature = 0.8f;
   sp.top_k = 40;
-  sp.max_new = 220;
+  sp.max_new = 160;
   const std::string probe = "### Usuário:\nOlá! Quem é você?\n\n### Assistente:\n";
 
   const double t0 = now_s();

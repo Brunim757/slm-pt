@@ -3,7 +3,7 @@
 
 CXX ?= g++
 BUILD ?= build
-CXXFLAGS ?= -std=c++17 -O3 -funroll-loops -Iinclude -pthread
+CXXFLAGS ?= -std=c++17 -O3 -funroll-loops -march=native -Iinclude -pthread
 LDFLAGS ?= -pthread
 
 LIB_SRC := $(wildcard src/*.cpp)

@@ -23,7 +23,7 @@ inline int get_threads() { return thread_count(); }
 inline void parallel_for(int n, const std::function<void(int, int)>& fn) {
   if (n <= 0) return;
   int nt = thread_count();
-  if (nt <= 1 || n < 128) {
+  if (nt <= 1 || n < 32) {
     fn(0, n);
     return;
   }
