@@ -28,9 +28,16 @@ scripts/         fetch_corpus.py (baixa corpus PT e formata o diálogo)
 
 ## Build local
 
+No Termux/Android o CMake entra em "modo Android" e quebra; use o **Makefile**:
+
 ```bash
-cmake -B build -DCMAKE_BUILD_TYPE=Release
-cmake --build build -j
+make -j"$(nproc)"     # binários em build/
+```
+
+No PC (Linux/macOS) qualquer um dos dois serve:
+
+```bash
+cmake -B build -DCMAKE_BUILD_TYPE=Release && cmake --build build -j
 ```
 
 ## Treinar
@@ -38,8 +45,8 @@ cmake --build build -j
 ```bash
 python3 scripts/fetch_corpus.py --out data/corpus.txt   # baixa o corpus PT
 ./build/slmpt_train --data data/corpus.txt --out runs \
-  --embd 192 --layer 4 --head 6 --block 192 --batch 48 \
-  --steps 20000 --max-minutes 300 --save-every 500 --sample-every 500
+  --embd 128 --layer 4 --head 4 --block 128 --batch 32 \
+  --steps 100000 --max-minutes 300 --save-every 500 --sample-every 250
 ```
 
 Retomar de um checkpoint:
@@ -69,12 +76,23 @@ respeitando um orçamento de tempo, publicando `runs/model.bin` e
 
 ```bash
 # dispara um treino manual
-gh workflow run train.yml -f steps=20000 -f max_minutes=300
+gh workflow run train.yml -f steps=100000 -f max_minutes=300 -f examples=12000
 
 # acompanha e baixa o resultado
 gh run watch
 gh run download --name slm-pt-run
 ```
 
-Para treinar por **dias**, baixe o artifact, e re-dispare passando
-`--resume runs/model.bin` (via inputs ou ajuste o workflow).
+Como o repositório é **público**, os minutos do Actions são ilimitados. Dá para
+treinar por **dias** encadeando runs: cada run publica `runs/model.bin`, e o
+próximo continua de onde parou com o input `resume_run=<run id anterior>`:
+
+```bash
+gh workflow run train.yml -f resume_run=44908829121 -f max_minutes=300
+```
+
+Ou, de uma vez, baixe o melhor checkpoint e converse com ele:
+
+```bash
+scripts/get_model.sh          # pega o último run bem-sucedido e abre o chat
+```
