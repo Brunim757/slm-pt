@@ -1,8 +1,15 @@
 name: probe
 on:
   workflow_dispatch:
+    inputs:
+      steps:
+        description: "s"
+        default: "10"
+      lr:
+        description: "l"
+        default: "3e-4"
 jobs:
   x:
     runs-on: ubuntu-latest
     steps:
-      - run: echo hi
+      - run: echo "steps=${{ github.event.inputs.steps || '1' }} lr=${{ github.event.inputs.lr || '3e-4' }}"
