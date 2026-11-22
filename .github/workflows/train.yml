@@ -15,6 +15,12 @@ on:
       examples:
         description: "alpaca pairs limit (0 = all)"
         default: "16000"
+      chat_weight:
+        description: "repeat factor for generated chat"
+        default: "8"
+      oasst_weight:
+        description: "repeat factor for oasst pairs"
+        default: "2"
       embd:
         description: "embedding dim"
         default: "192"
@@ -58,7 +64,10 @@ jobs:
 
       - name: Fetch Portuguese corpus
         run: |
-          python3 scripts/fetch_corpus.py --out data/corpus.txt --limit "${{ github.event.inputs.examples || '0' }}"
+          python3 scripts/fetch_corpus.py --out data/corpus.txt \
+            --limit "${{ github.event.inputs.examples || '16000' }}" \
+            --chat-weight "${{ github.event.inputs.chat_weight || '8' }}" \
+            --oasst-weight "${{ github.event.inputs.oasst_weight || '2' }}"
 
       - name: Build
         run: |
