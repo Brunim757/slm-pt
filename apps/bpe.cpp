@@ -3,6 +3,7 @@
 //
 //   slmpt_bpe --in data/corpus.txt --out data/tokenizer.txt \
 //             --ids data/corpus.ids --vocab 4096
+#include <algorithm>
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
@@ -55,21 +56,31 @@ int main(int argc, char** argv) {
   std::unordered_map<std::string, int> freq;
   for (const std::string& w : BPETokenizer::pretokenize(text)) freq[w]++;
 
+  std::vector<std::pair<std::string, int>> wf(freq.begin(), freq.end());
+  const int max_words = std::atoi(argval(argc, argv, "--max-words", "60000"));
+  if (max_words > 0 && static_cast<int>(wf.size()) > max_words) {
+    std::nth_element(wf.begin(), wf.begin() + max_words, wf.end(),
+                     [](const std::pair<std::string, int>& a,
+                        const std::pair<std::string, int>& b) {
+                       return a.second > b.second;
+                     });
+    wf.resize(max_words);
+  }
+
   std::vector<std::vector<int>> words;
-  words.reserve(freq.size());
-  for (const auto& kv : freq) {
+  words.reserve(wf.size());
+  std::vector<int> weight;
+  weight.reserve(wf.size());
+  for (const auto& kv : wf) {
     std::vector<int> sym;
     sym.reserve(kv.first.size());
     for (unsigned char c : kv.first) sym.push_back(static_cast<int>(c));
     words.push_back(std::move(sym));
-    // keep the weight in a parallel vector
+    weight.push_back(kv.second);
   }
-  std::vector<int> weight;
-  weight.reserve(freq.size());
-  for (const auto& kv : freq) weight.push_back(kv.second);
 
-  std::fprintf(stderr, "corpus %.2f MB, %zu unique words, target vocab %d\n",
-               text.size() / 1048576.0, words.size(), target_vocab);
+  std::fprintf(stderr, "corpus %.2f MB, %zu unique words (using %zu), target vocab %d\n",
+               text.size() / 1048576.0, freq.size(), words.size(), target_vocab);
 
   // 2) learn merges
   std::vector<std::pair<int, int>> merges;
