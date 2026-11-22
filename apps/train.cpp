@@ -13,6 +13,7 @@
 #include "slmpt/parallel.hpp"
 #include "slmpt/sampling.hpp"
 #include "slmpt/serialization.hpp"
+#include "slmpt/tokenizer.hpp"
 
 using namespace slmpt;
 
@@ -40,6 +41,8 @@ static double now_s() {
 int main(int argc, char** argv) {
   Config cfg;
   cfg.data = argval(argc, argv, "--data", cfg.data.c_str());
+  cfg.tokenizer = argval(argc, argv, "--tokenizer", cfg.tokenizer.c_str());
+  const std::string ids_path = argval(argc, argv, "--ids", "data/corpus.ids");
   cfg.out_dir = argval(argc, argv, "--out", cfg.out_dir.c_str());
   cfg.resume = argval(argc, argv, "--resume", "");
   cfg.n_embd = argi(argc, argv, "--embd", cfg.n_embd);
@@ -47,6 +50,7 @@ int main(int argc, char** argv) {
   cfg.n_head = argi(argc, argv, "--head", cfg.n_head);
   cfg.block = argi(argc, argv, "--block", cfg.block);
   cfg.batch = argi(argc, argv, "--batch", cfg.batch);
+  cfg.mlp_hidden = argi(argc, argv, "--mlp", cfg.mlp_hidden);
   cfg.max_steps = argi(argc, argv, "--steps", cfg.max_steps);
   cfg.warmup = argi(argc, argv, "--warmup", cfg.warmup);
   cfg.save_every = argi(argc, argv, "--save-every", cfg.save_every);
@@ -54,6 +58,7 @@ int main(int argc, char** argv) {
   cfg.lr = argf(argc, argv, "--lr", cfg.lr);
   cfg.weight_decay = argf(argc, argv, "--wd", cfg.weight_decay);
   cfg.grad_clip = argf(argc, argv, "--clip", cfg.grad_clip);
+  cfg.rope_theta = argf(argc, argv, "--rope-theta", cfg.rope_theta);
   cfg.max_minutes = std::atof(argval(argc, argv, "--max-minutes", "0"));
   const int threads = argi(argc, argv, "--threads", (int)std::thread::hardware_concurrency());
   cfg.seed = (uint64_t)std::atoll(argval(argc, argv, "--seed", "1337"));
@@ -61,8 +66,30 @@ int main(int argc, char** argv) {
   set_threads(threads > 0 ? threads : 1);
   std::filesystem::create_directories(cfg.out_dir);
 
+  // Tokenizer (byte-level fallback = empty merge table).
+  BPETokenizer tok;
+  if (tok.load(cfg.tokenizer)) {
+    std::fprintf(stderr, "tokenizer: %s (vocab %d)\n", cfg.tokenizer.c_str(),
+                 tok.vocab_size());
+  } else {
+    tok.set_merges({});
+    std::fprintf(stderr, "tokenizer: %s not found, using raw bytes (vocab 256)\n",
+                 cfg.tokenizer.c_str());
+  }
+  cfg.vocab = tok.vocab_size();
+
   Dataset ds;
-  if (!ds.load(cfg.data)) {
+  bool loaded = false;
+  if (ds.load_ids(ids_path)) {
+    loaded = true;
+    std::fprintf(stderr, "data(ids): %s (%.2f M tokens)\n", ids_path.c_str(),
+                 ds.size() / 1e6);
+  } else if (ds.load_text(cfg.data, tok)) {
+    loaded = true;
+    std::fprintf(stderr, "data(text): %s (%.2f MB)\n", cfg.data.c_str(),
+                 ds.size() / 1048576.0);
+  }
+  if (!loaded) {
     std::fprintf(stderr, "failed to load data: %s\n", cfg.data.c_str());
     return 1;
   }
@@ -71,10 +98,11 @@ int main(int argc, char** argv) {
   long params = 0;
   for (Param* p : model.params()) params += (long)p->size();
   std::printf("== slm-pt ==\n");
-  std::printf("data: %s (%.2f MB)\n", cfg.data.c_str(), ds.size() / 1048576.0);
-  std::printf("arch: embd=%d layer=%d head=%d block=%d batch=%d\n", cfg.n_embd,
-              cfg.n_layer, cfg.n_head, cfg.block, cfg.batch);
-  std::printf("params: %.2f M   threads: %d\n", params / 1e6, get_threads());
+  std::printf("arch: embd=%d layer=%d head=%d block=%d batch=%d mlp=%d vocab=%d\n",
+              cfg.n_embd, cfg.n_layer, cfg.n_head, cfg.block, cfg.batch, model.hidden(),
+              cfg.vocab);
+  std::printf("params: %.2f M   threads: %d   rope_theta=%.0f\n", params / 1e6,
+              get_threads(), cfg.rope_theta);
 
   if (!cfg.resume.empty()) {
     if (load_checkpoint(model, cfg.resume))
@@ -89,6 +117,7 @@ int main(int argc, char** argv) {
   std::vector<int> toks, tgts;
   const std::string ckpt = cfg.out_dir + "/model.bin";
   const std::string samples = cfg.out_dir + "/samples.txt";
+  const std::string tok_blob = tok.to_string();
   SampleParams sp;
   sp.temperature = 0.8f;
   sp.top_k = 40;
@@ -130,9 +159,7 @@ int main(int argc, char** argv) {
     }
 
     if (cfg.sample_every > 0 && step % cfg.sample_every == 0) {
-      std::string text = generate(model, probe, sp, rng);
-      auto pos = text.find("\n\n");
-      if (pos != std::string::npos) text = text.substr(0, pos);
+      std::string text = generate(model, tok, probe, sp, rng);
       FILE* f = std::fopen(samples.c_str(), "a");
       if (f) {
         std::fprintf(f, "=== step %d ===\n%s\n\n", step, text.c_str());
@@ -143,7 +170,7 @@ int main(int argc, char** argv) {
     }
 
     if (cfg.save_every > 0 && step % cfg.save_every == 0) {
-      save_checkpoint(model, ckpt);
+      save_checkpoint(model, ckpt, tok_blob);
       std::printf("  [saved] %s\n", ckpt.c_str());
     }
     if ((t - t0) > budget) {
@@ -152,10 +179,8 @@ int main(int argc, char** argv) {
     }
   }
 
-  save_checkpoint(model, ckpt);
-  std::string text = generate(model, probe, sp, rng);
-  auto pos = text.find("\n\n");
-  if (pos != std::string::npos) text = text.substr(0, pos);
+  save_checkpoint(model, ckpt, tok_blob);
+  std::string text = generate(model, tok, probe, sp, rng);
   std::printf("\nfinal sample:\n%s\n", text.c_str());
   std::printf("saved checkpoint: %s\n", ckpt.c_str());
   return 0;

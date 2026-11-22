@@ -11,18 +11,15 @@
 namespace slmpt {
 namespace {
 
-constexpr float kLnEps = 1e-5f;
-
-// y[rows,out] = x[rows,in] @ W[out,in]^T + b   (b may be null)
-void linear_fwd(const float* x, const float* W, const float* b, float* y, int rows,
-                int in, int out) {
+// y[rows,out] = x[rows,in] @ W[out,in]^T   (W row-major [out][in])
+void linear_fwd(const float* x, const float* W, float* y, int rows, int in, int out) {
   parallel_for(rows, [&](int r0, int r1) {
     for (int r = r0; r < r1; ++r) {
       const float* xr = x + static_cast<size_t>(r) * in;
       float* yr = y + static_cast<size_t>(r) * out;
       for (int o = 0; o < out; ++o) {
         const float* wo = W + static_cast<size_t>(o) * in;
-        float acc = b ? b[o] : 0.f;
+        float acc = 0.f;
         for (int i = 0; i < in; ++i) acc += xr[i] * wo[i];
         yr[o] = acc;
       }
@@ -30,9 +27,9 @@ void linear_fwd(const float* x, const float* W, const float* b, float* y, int ro
   });
 }
 
-// Accumulates into dx, dW, db (caller zeroes them once per step).
-void linear_bwd(const float* x, const float* W, const float* dy, float* dx,
-                float* dW, float* db, int rows, int in, int out) {
+// Accumulates into dx, dW (caller zeroes them once per step).
+void linear_bwd(const float* x, const float* W, const float* dy, float* dx, float* dW,
+                int rows, int in, int out) {
   if (dx) {
     parallel_for(rows, [&](int r0, int r1) {
       for (int r = r0; r < r1; ++r) {
@@ -48,101 +45,72 @@ void linear_bwd(const float* x, const float* W, const float* dy, float* dx,
       }
     });
   }
-  if (!dW && !db) return;
+  if (!dW) return;
   parallel_for(out, [&](int o0, int o1) {
     for (int o = o0; o < o1; ++o) {
-      if (db) {
-        float acc = 0.f;
-        for (int r = 0; r < rows; ++r) acc += dy[static_cast<size_t>(r) * out + o];
-        db[o] += acc;
-      }
-      if (dW) {
-        float* dwo = dW + static_cast<size_t>(o) * in;
-        for (int r = 0; r < rows; ++r) {
-          const float g = dy[static_cast<size_t>(r) * out + o];
-          if (g == 0.f) continue;
-          const float* xr = x + static_cast<size_t>(r) * in;
-          for (int i = 0; i < in; ++i) dwo[i] += g * xr[i];
-        }
+      float* dwo = dW + static_cast<size_t>(o) * in;
+      for (int r = 0; r < rows; ++r) {
+        const float g = dy[static_cast<size_t>(r) * out + o];
+        if (g == 0.f) continue;
+        const float* xr = x + static_cast<size_t>(r) * in;
+        for (int i = 0; i < in; ++i) dwo[i] += g * xr[i];
       }
     }
   });
 }
 
-void ln_fwd(const float* x, const float* g, const float* b, float* y, float* mean,
-            float* rstd, int rows, int C) {
+// RMSNorm: y = g * x / sqrt(mean(x^2) + eps)
+void rmsnorm_fwd(const float* x, const float* g, float* y, float* rstd, int rows,
+                 int C, float eps) {
   parallel_for(rows, [&](int r0, int r1) {
     for (int r = r0; r < r1; ++r) {
       const float* xr = x + static_cast<size_t>(r) * C;
-      float m = 0.f;
-      for (int i = 0; i < C; ++i) m += xr[i];
-      m /= C;
-      float var = 0.f;
-      for (int i = 0; i < C; ++i) {
-        const float d = xr[i] - m;
-        var += d * d;
-      }
-      var /= C;
-      const float rs = 1.f / std::sqrt(var + kLnEps);
-      mean[r] = m;
+      float ms = 0.f;
+      for (int i = 0; i < C; ++i) ms += xr[i] * xr[i];
+      ms /= C;
+      const float rs = 1.f / std::sqrt(ms + eps);
       rstd[r] = rs;
       float* yr = y + static_cast<size_t>(r) * C;
-      for (int i = 0; i < C; ++i) yr[i] = g[i] * (xr[i] - m) * rs + b[i];
+      for (int i = 0; i < C; ++i) yr[i] = g[i] * xr[i] * rs;
     }
   });
 }
 
-void ln_bwd(const float* x, const float* g, const float* dy, float* dx, float* dg,
-            float* db, const float* mean, const float* rstd, int rows, int C) {
+void rmsnorm_bwd(const float* x, const float* g, const float* dy, float* dx, float* dg,
+                 const float* rstd, int rows, int C) {
   parallel_for(rows, [&](int r0, int r1) {
     for (int r = r0; r < r1; ++r) {
       const float* xr = x + static_cast<size_t>(r) * C;
       const float* dyr = dy + static_cast<size_t>(r) * C;
       float* dxr = dx + static_cast<size_t>(r) * C;
-      const float m = mean[r], rs = rstd[r];
-      float s1 = 0.f, s2 = 0.f;
-      for (int i = 0; i < C; ++i) {
-        const float xn = (xr[i] - m) * rs;
-        const float gd = g[i] * dyr[i];
-        s1 += gd;
-        s2 += gd * xn;
-      }
-      const float inv = 1.f / C;
-      for (int i = 0; i < C; ++i) {
-        const float xn = (xr[i] - m) * rs;
-        const float gd = g[i] * dyr[i];
-        dxr[i] = rs * (gd - s1 * inv - xn * s2 * inv);
-      }
+      const float inv = rstd[r];
+      float S = 0.f;
+      for (int i = 0; i < C; ++i) S += g[i] * dyr[i] * xr[i];
+      const float k = inv * inv * inv * S / C;
+      for (int i = 0; i < C; ++i) dxr[i] = g[i] * dyr[i] * inv - xr[i] * k;
     }
   });
-  if (dg || db) {
+  if (dg) {
     for (int i = 0; i < C; ++i) {
-      float sg = 0.f, sb = 0.f;
-      for (int r = 0; r < rows; ++r) {
-        const float xn = (x[static_cast<size_t>(r) * C + i] - mean[r]) * rstd[r];
-        sg += dy[static_cast<size_t>(r) * C + i] * xn;
-        sb += dy[static_cast<size_t>(r) * C + i];
-      }
-      if (dg) dg[i] += sg;
-      if (db) db[i] += sb;
+      float sg = 0.f;
+      for (int r = 0; r < rows; ++r)
+        sg += dy[static_cast<size_t>(r) * C + i] * x[static_cast<size_t>(r) * C + i] *
+              rstd[r];
+      dg[i] += sg;
     }
   }
 }
 
-inline float gelu(float x) {
-  return 0.5f * x * (1.f + std::tanh(0.7978845608f * (x + 0.044715f * x * x * x)));
+inline float silu(float x) { return x / (1.f + std::exp(-x)); }
+inline float silu_grad(float x) {
+  const float s = 1.f / (1.f + std::exp(-x));
+  return s + x * s * (1.f - s);
 }
-inline float gelu_grad(float x) {
-  const float u = 0.7978845608f * (x + 0.044715f * x * x * x);
-  const float t = std::tanh(u);
-  const float du = 0.7978845608f * (1.f + 3.f * 0.044715f * x * x);
-  return 0.5f * (1.f + t) + 0.5f * x * (1.f - t * t) * du;
+void silu_fwd(const float* x, float* y, int n) {
+  for (int i = 0; i < n; ++i) y[i] = silu(x[i]);
 }
-void gelu_fwd(const float* x, float* y, int n) {
-  for (int i = 0; i < n; ++i) y[i] = gelu(x[i]);
-}
-void gelu_bwd(const float* x, const float* dy, float* dx, int n) {
-  for (int i = 0; i < n; ++i) dx[i] = dy[i] * gelu_grad(x[i]);
+void silu_bwd(const float* x, const float* dy, float* dx, int n) {
+  for (int i = 0; i < n; ++i) dx[i] = dy[i] * silu_grad(x[i]);
 }
 
 }  // namespace
@@ -155,44 +123,62 @@ Model::Model(const Config& cfg) : cfg_(cfg), rng_(cfg.seed) {
   V_ = cfg.vocab;
   B_ = cfg.batch;
   hd_ = C_ / H_;
-  if (C_ % H_ != 0) {
-    std::fprintf(stderr, "n_embd (%d) must be divisible by n_head (%d)\n", C_, H_);
+  if (C_ % H_ != 0 || hd_ % 2 != 0) {
+    std::fprintf(stderr, "bad head config: n_embd=%d n_head=%d (head_dim must be even)\n",
+                 C_, H_);
     std::exit(1);
   }
+  if (cfg.mlp_hidden > 0) {
+    Hd_ = cfg.mlp_hidden;
+  } else {
+    const int raw = (8 * C_) / 3;
+    Hd_ = ((raw + 63) / 64) * 64;  // round up to a multiple of 64
+    if (Hd_ < 64) Hd_ = 64;
+  }
+  build_rope();
   init_params();
   reallocate(B_);
 }
 
+void Model::build_rope() {
+  const int half = hd_ / 2;
+  cos_.assign(static_cast<size_t>(T_) * half, 0.f);
+  sin_.assign(static_cast<size_t>(T_) * half, 0.f);
+  for (int p = 0; p < T_; ++p) {
+    for (int i = 0; i < half; ++i) {
+      const float freq = 1.f / std::pow(cfg_.rope_theta, (2.f * i) / hd_);
+      const float ang = p * freq;
+      cos_[static_cast<size_t>(p) * half + i] = std::cos(ang);
+      sin_[static_cast<size_t>(p) * half + i] = std::sin(ang);
+    }
+  }
+}
+
 void Model::init_params() {
   wte_ = add(static_cast<size_t>(V_) * C_);
-  wpe_ = add(static_cast<size_t>(T_) * C_);
   layers_.resize(L_);
   for (int l = 0; l < L_; ++l) {
     LayerWeights& w = layers_[l];
-    w.ln1g = add(C_); w.ln1b = add(C_);
-    w.Wq = add(static_cast<size_t>(C_) * C_); w.bq = add(C_);
-    w.Wk = add(static_cast<size_t>(C_) * C_); w.bk = add(C_);
-    w.Wv = add(static_cast<size_t>(C_) * C_); w.bv = add(C_);
-    w.Wo = add(static_cast<size_t>(C_) * C_); w.bo = add(C_);
-    w.ln2g = add(C_); w.ln2b = add(C_);
-    w.fc1 = add(static_cast<size_t>(C_) * 4 * C_); w.b1 = add(4 * C_);
-    w.fc2 = add(static_cast<size_t>(4) * C_ * C_); w.b2 = add(C_);
+    w.ln1g = add(C_);
+    w.Wq = add(static_cast<size_t>(C_) * C_);
+    w.Wk = add(static_cast<size_t>(C_) * C_);
+    w.Wv = add(static_cast<size_t>(C_) * C_);
+    w.Wo = add(static_cast<size_t>(C_) * C_);
+    w.ln2g = add(C_);
+    w.W1 = add(static_cast<size_t>(Hd_) * C_);
+    w.W3 = add(static_cast<size_t>(Hd_) * C_);
+    w.W2 = add(static_cast<size_t>(C_) * Hd_);
   }
-  lnfg_ = add(C_); lnfb_ = add(C_);
+  lnfg_ = add(C_);
 
-  // init: N(0, 0.02), layernorm gains = 1.
+  // init: N(0, 0.02); RMSNorm gains = 1.
   for (Param* p : params_)
     for (float& x : p->data) x = 0.02f * rng_.normal();
   for (int l = 0; l < L_; ++l) {
     std::fill(layers_[l].ln1g->data.begin(), layers_[l].ln1g->data.end(), 1.f);
     std::fill(layers_[l].ln2g->data.begin(), layers_[l].ln2g->data.end(), 1.f);
-    std::fill(layers_[l].bq->data.begin(), layers_[l].bq->data.end(), 0.f);
-    std::fill(layers_[l].bk->data.begin(), layers_[l].bk->data.end(), 0.f);
-    std::fill(layers_[l].bv->data.begin(), layers_[l].bv->data.end(), 0.f);
-    std::fill(layers_[l].bo->data.begin(), layers_[l].bo->data.end(), 0.f);
   }
   std::fill(lnfg_->data.begin(), lnfg_->data.end(), 1.f);
-  std::fill(lnfb_->data.begin(), lnfb_->data.end(), 0.f);
 }
 
 void Model::reallocate(int batch) {
@@ -200,14 +186,13 @@ void Model::reallocate(int batch) {
   R_ = B_ * T_;
   acts_.resize(L_);
   const size_t rc = static_cast<size_t>(R_) * C_;
-  const size_t rc4 = static_cast<size_t>(R_) * 4 * C_;
+  const size_t rh = static_cast<size_t>(R_) * Hd_;
   const size_t rv = static_cast<size_t>(R_) * V_;
   x_.assign(rc, 0.f);
   o_.assign(rc, 0.f);
   xf_.assign(rc, 0.f);
   logits_.assign(rv, 0.f);
   dlogits_.assign(rv, 0.f);
-  meanf_.assign(R_, 0.f);
   rstdf_.assign(R_, 0.f);
   for (int l = 0; l < L_; ++l) {
     LayerActs& A = acts_[l];
@@ -219,14 +204,82 @@ void Model::reallocate(int batch) {
     A.ctx.assign(rc, 0.f);
     A.x1.assign(rc, 0.f);
     A.a2.assign(rc, 0.f);
-    A.h1.assign(rc4, 0.f);
-    A.h2.assign(rc4, 0.f);
-    A.h3.assign(rc, 0.f);
-    A.ln1_mean.assign(R_, 0.f);
+    A.h1.assign(rh, 0.f);
+    A.h2.assign(rh, 0.f);
+    A.h3.assign(rh, 0.f);
+    A.h4.assign(rh, 0.f);
     A.ln1_rstd.assign(R_, 0.f);
-    A.ln2_mean.assign(R_, 0.f);
     A.ln2_rstd.assign(R_, 0.f);
     A.att.assign(static_cast<size_t>(B_) * H_ * T_ * T_, 0.f);
+  }
+  // KV cache + single-token inference scratch
+  cache_k_.assign(static_cast<size_t>(L_) * T_ * C_, 0.f);
+  cache_v_.assign(static_cast<size_t>(L_) * T_ * C_, 0.f);
+  ic_x_.assign(C_, 0.f);
+  ic_a_.assign(C_, 0.f);
+  ic_q_.assign(C_, 0.f);
+  ic_k_.assign(C_, 0.f);
+  ic_v_.assign(C_, 0.f);
+  ic_ctx_.assign(C_, 0.f);
+  ic_o_.assign(C_, 0.f);
+  ic_h1_.assign(Hd_, 0.f);
+  ic_h2_.assign(Hd_, 0.f);
+  ic_h3_.assign(Hd_, 0.f);
+  ic_h4_.assign(Hd_, 0.f);
+  ic_logits_.assign(V_, 0.f);
+  ic_scores_.assign(T_, 0.f);
+  cache_pos_ = 0;
+}
+
+void Model::rope_apply(float* x, int rows, int T) const {
+  const int C = C_, H = H_, hd = hd_, half = hd / 2;
+  parallel_for(rows, [&](int r0, int r1) {
+    for (int r = r0; r < r1; ++r) {
+      const int pos = r % T;
+      const float* cs = cos_.data() + static_cast<size_t>(pos) * half;
+      const float* sn = sin_.data() + static_cast<size_t>(pos) * half;
+      for (int h = 0; h < H; ++h) {
+        float* v = x + static_cast<size_t>(r) * C + h * hd;
+        for (int i = 0; i < half; ++i) {
+          const float a = v[2 * i], b = v[2 * i + 1];
+          v[2 * i] = a * cs[i] - b * sn[i];
+          v[2 * i + 1] = a * sn[i] + b * cs[i];
+        }
+      }
+    }
+  });
+}
+
+void Model::rope_apply_inv(float* x, int rows, int T) const {
+  const int C = C_, H = H_, hd = hd_, half = hd / 2;
+  parallel_for(rows, [&](int r0, int r1) {
+    for (int r = r0; r < r1; ++r) {
+      const int pos = r % T;
+      const float* cs = cos_.data() + static_cast<size_t>(pos) * half;
+      const float* sn = sin_.data() + static_cast<size_t>(pos) * half;
+      for (int h = 0; h < H; ++h) {
+        float* v = x + static_cast<size_t>(r) * C + h * hd;
+        for (int i = 0; i < half; ++i) {
+          const float a = v[2 * i], b = v[2 * i + 1];
+          v[2 * i] = a * cs[i] + b * sn[i];
+          v[2 * i + 1] = -a * sn[i] + b * cs[i];
+        }
+      }
+    }
+  });
+}
+
+void Model::rope_apply_one(float* x, int pos) const {
+  const int H = H_, hd = hd_, half = hd / 2;
+  const float* cs = cos_.data() + static_cast<size_t>(pos) * half;
+  const float* sn = sin_.data() + static_cast<size_t>(pos) * half;
+  for (int h = 0; h < H; ++h) {
+    float* v = x + h * hd;
+    for (int i = 0; i < half; ++i) {
+      const float a = v[2 * i], b = v[2 * i + 1];
+      v[2 * i] = a * cs[i] - b * sn[i];
+      v[2 * i + 1] = a * sn[i] + b * cs[i];
+    }
   }
 }
 
@@ -234,7 +287,7 @@ void Model::forward(const int* toks, int B, int T) {
   curB_ = B;
   curT_ = T;
   curR_ = B * T;
-  const int R = curR_, C = C_, Tc = T;
+  const int R = curR_, C = C_, Tc = T, Hd = Hd_;
   if (R > R_) {
     std::fprintf(stderr, "forward: R=%d exceeds capacity %d\n", R, R_);
     std::exit(1);
@@ -242,12 +295,9 @@ void Model::forward(const int* toks, int B, int T) {
 
   parallel_for(R, [&](int r0, int r1) {
     for (int r = r0; r < r1; ++r) {
-      const int t = toks[r];
-      const int p = r % Tc;
-      const float* e = wte_->data.data() + static_cast<size_t>(t) * C;
-      const float* pe = wpe_->data.data() + static_cast<size_t>(p) * C;
+      const float* e = wte_->data.data() + static_cast<size_t>(toks[r]) * C;
       float* xr = x_.data() + static_cast<size_t>(r) * C;
-      for (int c = 0; c < C; ++c) xr[c] = e[c] + pe[c];
+      for (int c = 0; c < C; ++c) xr[c] = e[c];
     }
   });
 
@@ -256,29 +306,31 @@ void Model::forward(const int* toks, int B, int T) {
     LayerActs& A = acts_[l];
 
     std::copy(x_.begin(), x_.begin() + static_cast<size_t>(R) * C, A.xin.begin());
-    ln_fwd(x_.data(), w.ln1g->data.data(), w.ln1b->data.data(), A.a.data(),
-           A.ln1_mean.data(), A.ln1_rstd.data(), R, C);
-    linear_fwd(A.a.data(), w.Wq->data.data(), w.bq->data.data(), A.q.data(), R, C, C);
-    linear_fwd(A.a.data(), w.Wk->data.data(), w.bk->data.data(), A.k.data(), R, C, C);
-    linear_fwd(A.a.data(), w.Wv->data.data(), w.bv->data.data(), A.v.data(), R, C, C);
+    rmsnorm_fwd(x_.data(), w.ln1g->data.data(), A.a.data(), A.ln1_rstd.data(), R, C,
+                cfg_.rms_eps);
+    linear_fwd(A.a.data(), w.Wq->data.data(), A.q.data(), R, C, C);
+    linear_fwd(A.a.data(), w.Wk->data.data(), A.k.data(), R, C, C);
+    linear_fwd(A.a.data(), w.Wv->data.data(), A.v.data(), R, C, C);
+    rope_apply(A.q.data(), R, Tc);
+    rope_apply(A.k.data(), R, Tc);
     attn_forward(A, B, Tc);
-    linear_fwd(A.ctx.data(), w.Wo->data.data(), w.bo->data.data(), o_.data(), R, C, C);
+    linear_fwd(A.ctx.data(), w.Wo->data.data(), o_.data(), R, C, C);
     for (size_t i = 0; i < static_cast<size_t>(R) * C; ++i) x_[i] += o_[i];
 
     std::copy(x_.begin(), x_.begin() + static_cast<size_t>(R) * C, A.x1.begin());
-    ln_fwd(x_.data(), w.ln2g->data.data(), w.ln2b->data.data(), A.a2.data(),
-           A.ln2_mean.data(), A.ln2_rstd.data(), R, C);
-    linear_fwd(A.a2.data(), w.fc1->data.data(), w.b1->data.data(), A.h1.data(), R, C,
-               4 * C);
-    gelu_fwd(A.h1.data(), A.h2.data(), R * 4 * C);
-    linear_fwd(A.h2.data(), w.fc2->data.data(), w.b2->data.data(), A.h3.data(), R, 4 * C,
-               C);
-    for (size_t i = 0; i < static_cast<size_t>(R) * C; ++i) x_[i] += A.h3[i];
+    rmsnorm_fwd(x_.data(), w.ln2g->data.data(), A.a2.data(), A.ln2_rstd.data(), R, C,
+                cfg_.rms_eps);
+    linear_fwd(A.a2.data(), w.W1->data.data(), A.h1.data(), R, C, Hd);
+    silu_fwd(A.h1.data(), A.h2.data(), R * Hd);
+    linear_fwd(A.a2.data(), w.W3->data.data(), A.h3.data(), R, C, Hd);
+    for (size_t i = 0; i < static_cast<size_t>(R) * Hd; ++i) A.h4[i] = A.h2[i] * A.h3[i];
+    linear_fwd(A.h4.data(), w.W2->data.data(), o_.data(), R, Hd, C);
+    for (size_t i = 0; i < static_cast<size_t>(R) * C; ++i) x_[i] += o_[i];
   }
 
-  ln_fwd(x_.data(), lnfg_->data.data(), lnfb_->data.data(), xf_.data(), meanf_.data(),
-         rstdf_.data(), R, C);
-  linear_fwd(xf_.data(), wte_->data.data(), nullptr, logits_.data(), R, C, V_);
+  rmsnorm_fwd(x_.data(), lnfg_->data.data(), xf_.data(), rstdf_.data(), R, C,
+              cfg_.rms_eps);
+  linear_fwd(xf_.data(), wte_->data.data(), logits_.data(), R, C, V_);
 }
 
 void Model::attn_forward(LayerActs& A, int B, int T) {
@@ -404,20 +456,18 @@ double Model::cross_entropy(const int* tgts) {
 }
 
 void Model::backward(const int* toks) {
-  const int R = curR_, C = C_, T = curT_, B = curB_, V = V_;
+  const int R = curR_, C = C_, T = curT_, B = curB_, V = V_, Hd = Hd_;
   const size_t rc = static_cast<size_t>(R) * C;
-  const size_t rc4 = static_cast<size_t>(R) * 4 * C;
+  const size_t rh = static_cast<size_t>(R) * Hd;
 
   std::vector<float> dcur(rc, 0.f), tmp(rc, 0.f);
-  // grad wrt xf, via tied output projection
   linear_bwd(xf_.data(), wte_->data.data(), dlogits_.data(), dcur.data(),
-             wte_->grad.data(), nullptr, R, C, V);
-  // final layernorm (input x_, output xf_)
+             wte_->grad.data(), R, C, V);
   std::vector<float> dx(rc, 0.f);
-  ln_bwd(x_.data(), lnfg_->data.data(), dcur.data(), dx.data(), lnfg_->grad.data(),
-         lnfb_->grad.data(), meanf_.data(), rstdf_.data(), R, C);
+  rmsnorm_bwd(x_.data(), lnfg_->data.data(), dcur.data(), dx.data(), lnfg_->grad.data(),
+              rstdf_.data(), R, C);
 
-  std::vector<float> dh3(rc), dh2(rc4), dh1(rc4), da2(rc), dctx(rc), da(rc);
+  std::vector<float> dh4(rh), dh2(rh), dh3(rh), dh1(rh), da2(rc), dctx(rc), da(rc);
   std::vector<float> dq(rc), dk(rc), dv(rc);
   std::vector<float> da_q(rc), da_k(rc), da_v(rc), dxin(rc);
 
@@ -425,47 +475,53 @@ void Model::backward(const int* toks) {
     LayerWeights& w = layers_[l];
     LayerActs& A = acts_[l];
 
-    // x_after = x1 + h3  =>  grad wrt h3 = dx ; residual passthrough stays in dx
-    std::copy(dx.begin(), dx.end(), dh3.begin());
-    linear_bwd(A.h2.data(), w.fc2->data.data(), dh3.data(), dh2.data(),
-               w.fc2->grad.data(), w.b2->grad.data(), R, 4 * C, C);
-    gelu_bwd(A.h1.data(), dh2.data(), dh1.data(), R * 4 * C);
-    linear_bwd(A.a2.data(), w.fc1->data.data(), dh1.data(), da2.data(),
-               w.fc1->grad.data(), w.b1->grad.data(), R, C, 4 * C);
-    ln_bwd(A.x1.data(), w.ln2g->data.data(), da2.data(), tmp.data(),
-           w.ln2g->grad.data(), w.ln2b->grad.data(), A.ln2_mean.data(),
-           A.ln2_rstd.data(), R, C);
+    // x_after = x1 + o(mlp)  =>  grad wrt mlp output = dx
+    linear_bwd(A.h4.data(), w.W2->data.data(), dx.data(), dh4.data(), w.W2->grad.data(),
+               R, Hd, C);
+    // h4 = h2 * h3
+    for (size_t i = 0; i < rh; ++i) {
+      dh2[i] = dh4[i] * A.h3[i];
+      dh3[i] = dh4[i] * A.h2[i];
+    }
+    // h2 = silu(h1)
+    silu_bwd(A.h1.data(), dh2.data(), dh1.data(), R * Hd);
+    linear_bwd(A.a2.data(), w.W1->data.data(), dh1.data(), da2.data(), w.W1->grad.data(),
+               R, C, Hd);
+    // W3 contributes to the same a2 grad
+    std::vector<float> da2b(rc, 0.f);
+    linear_bwd(A.a2.data(), w.W3->data.data(), dh3.data(), da2b.data(),
+               w.W3->grad.data(), R, C, Hd);
+    for (size_t i = 0; i < rc; ++i) da2[i] += da2b[i];
+    rmsnorm_bwd(A.x1.data(), w.ln2g->data.data(), da2.data(), tmp.data(),
+                w.ln2g->grad.data(), A.ln2_rstd.data(), R, C);
     for (size_t i = 0; i < rc; ++i) dx[i] += tmp[i];  // now grad wrt x1
 
-    // x1 = x0 + o , o = Wo*ctx + bo  =>  grad wrt o = dx
+    // x1 = x0 + o(attn)
     linear_bwd(A.ctx.data(), w.Wo->data.data(), dx.data(), dctx.data(),
-               w.Wo->grad.data(), w.bo->grad.data(), R, C, C);
+               w.Wo->grad.data(), R, C, C);
     attn_backward(A, B, T, dctx.data(), dq, dk, dv);
+    // undo RoPE on the query/key gradients (attention used rotated q,k)
+    rope_apply_inv(dq.data(), R, T);
+    rope_apply_inv(dk.data(), R, T);
     linear_bwd(A.a.data(), w.Wq->data.data(), dq.data(), da_q.data(), w.Wq->grad.data(),
-               w.bq->grad.data(), R, C, C);
+               R, C, C);
     linear_bwd(A.a.data(), w.Wk->data.data(), dk.data(), da_k.data(), w.Wk->grad.data(),
-               w.bk->grad.data(), R, C, C);
+               R, C, C);
     linear_bwd(A.a.data(), w.Wv->data.data(), dv.data(), da_v.data(), w.Wv->grad.data(),
-               w.bv->grad.data(), R, C, C);
+               R, C, C);
     for (size_t i = 0; i < rc; ++i) da[i] = da_q[i] + da_k[i] + da_v[i];
-    ln_bwd(A.xin.data(), w.ln1g->data.data(), da.data(), dxin.data(),
-           w.ln1g->grad.data(), w.ln1b->grad.data(), A.ln1_mean.data(),
-           A.ln1_rstd.data(), R, C);
-    for (size_t i = 0; i < rc; ++i) dx[i] += dxin[i];  // now grad wrt block input
+    rmsnorm_bwd(A.xin.data(), w.ln1g->data.data(), da.data(), dxin.data(),
+                w.ln1g->grad.data(), A.ln1_rstd.data(), R, C);
+    for (size_t i = 0; i < rc; ++i) dx[i] += dxin[i];  // grad wrt block input
   }
 
-  // token + position embedding grads
+  // token embedding grads
   parallel_for(R, [&](int r0, int r1) {
     for (int r = r0; r < r1; ++r) {
       const int t = toks[r];
-      const int p = r % T;
       const float* dxr = dx.data() + static_cast<size_t>(r) * C;
       float* gwte = wte_->grad.data() + static_cast<size_t>(t) * C;
-      float* gwpe = wpe_->grad.data() + static_cast<size_t>(p) * C;
-      for (int c = 0; c < C; ++c) {
-        gwte[c] += dxr[c];
-        gwpe[c] += dxr[c];
-      }
+      for (int c = 0; c < C; ++c) gwte[c] += dxr[c];
     }
   });
 }
@@ -483,8 +539,106 @@ double Model::compute_loss(const int* toks, const int* tgts, int B, int T) {
   return cross_entropy(tgts);
 }
 
+void Model::mean_hidden(std::vector<float>& out) const {
+  out.assign(C_, 0.f);
+  if (curR_ <= 0) return;
+  for (int r = 0; r < curR_; ++r) {
+    const float* xr = xf_.data() + static_cast<size_t>(r) * C_;
+    for (int c = 0; c < C_; ++c) out[c] += xr[c];
+  }
+  const float inv = 1.f / curR_;
+  for (int c = 0; c < C_; ++c) out[c] *= inv;
+}
+
 void Model::zero_grad() {
   for (Param* p : params_) std::fill(p->grad.begin(), p->grad.end(), 0.f);
+}
+
+// ---------------------------------------------------------------------------
+// Incremental inference with a KV cache.
+// ---------------------------------------------------------------------------
+void Model::reset_cache() {
+  cache_pos_ = 0;
+  std::fill(cache_k_.begin(), cache_k_.end(), 0.f);
+  std::fill(cache_v_.begin(), cache_v_.end(), 0.f);
+}
+
+const float* Model::forward_token(int token) {
+  const int C = C_, H = H_, hd = hd_, Hd = Hd_;
+  const int pos = cache_pos_;
+  if (pos >= T_) {
+    // Safety net: context exhausted. Callers should stop generating before
+    // this point; if not, drop history and continue (never crash).
+    reset_cache();
+  }
+  const int p = cache_pos_;
+  const float scale = 1.f / std::sqrt(static_cast<float>(hd));
+
+  const float* e = wte_->data.data() + static_cast<size_t>(token) * C;
+  for (int c = 0; c < C; ++c) ic_x_[c] = e[c];
+
+  for (int l = 0; l < L_; ++l) {
+    LayerWeights& w = layers_[l];
+    float rstd = 0.f;
+    rmsnorm_fwd(ic_x_.data(), w.ln1g->data.data(), ic_a_.data(), &rstd, 1, C,
+                cfg_.rms_eps);
+    linear_fwd(ic_a_.data(), w.Wq->data.data(), ic_q_.data(), 1, C, C);
+    linear_fwd(ic_a_.data(), w.Wk->data.data(), ic_k_.data(), 1, C, C);
+    linear_fwd(ic_a_.data(), w.Wv->data.data(), ic_v_.data(), 1, C, C);
+    rope_apply_one(ic_q_.data(), p);
+    rope_apply_one(ic_k_.data(), p);
+
+    float* ck = cache_k_.data() + (static_cast<size_t>(l) * T_ + p) * C;
+    float* cv = cache_v_.data() + (static_cast<size_t>(l) * T_ + p) * C;
+    std::memcpy(ck, ic_k_.data(), C * sizeof(float));
+    std::memcpy(cv, ic_v_.data(), C * sizeof(float));
+
+    for (int h = 0; h < H; ++h) {
+      const float* qi = ic_q_.data() + h * hd;
+      float* sc = ic_scores_.data();
+      float mx = -1e30f;
+      for (int j = 0; j <= p; ++j) {
+        const float* kj = cache_k_.data() + (static_cast<size_t>(l) * T_ + j) * C + h * hd;
+        float s = 0.f;
+        for (int d = 0; d < hd; ++d) s += qi[d] * kj[d];
+        s *= scale;
+        sc[j] = s;
+        if (s > mx) mx = s;
+      }
+      float sum = 0.f;
+      for (int j = 0; j <= p; ++j) {
+        const float ex = std::exp(sc[j] - mx);
+        sc[j] = ex;
+        sum += ex;
+      }
+      const float inv = 1.f / sum;
+      float* ci = ic_ctx_.data() + h * hd;
+      for (int d = 0; d < hd; ++d) ci[d] = 0.f;
+      for (int j = 0; j <= p; ++j) {
+        const float* vj = cache_v_.data() + (static_cast<size_t>(l) * T_ + j) * C + h * hd;
+        const float pr = sc[j] * inv;
+        for (int d = 0; d < hd; ++d) ci[d] += pr * vj[d];
+      }
+    }
+
+    linear_fwd(ic_ctx_.data(), w.Wo->data.data(), ic_o_.data(), 1, C, C);
+    for (int c = 0; c < C; ++c) ic_x_[c] += ic_o_[c];
+
+    rmsnorm_fwd(ic_x_.data(), w.ln2g->data.data(), ic_a_.data(), &rstd, 1, C,
+                cfg_.rms_eps);
+    linear_fwd(ic_a_.data(), w.W1->data.data(), ic_h1_.data(), 1, C, Hd);
+    silu_fwd(ic_h1_.data(), ic_h2_.data(), Hd);
+    linear_fwd(ic_a_.data(), w.W3->data.data(), ic_h3_.data(), 1, C, Hd);
+    for (int i = 0; i < Hd; ++i) ic_h4_[i] = ic_h2_[i] * ic_h3_[i];
+    linear_fwd(ic_h4_.data(), w.W2->data.data(), ic_o_.data(), 1, Hd, C);
+    for (int c = 0; c < C; ++c) ic_x_[c] += ic_o_[c];
+  }
+
+  float rstd = 0.f;
+  rmsnorm_fwd(ic_x_.data(), lnfg_->data.data(), ic_a_.data(), &rstd, 1, C, cfg_.rms_eps);
+  linear_fwd(ic_a_.data(), wte_->data.data(), ic_logits_.data(), 1, C, V_);
+  cache_pos_++;
+  return ic_logits_.data();
 }
 
 }  // namespace slmpt

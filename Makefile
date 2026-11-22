@@ -8,7 +8,7 @@ LDFLAGS ?= -pthread
 
 LIB_SRC := $(wildcard src/*.cpp)
 LIB_OBJ := $(patsubst src/%.cpp,$(BUILD)/%.o,$(LIB_SRC))
-APPS := train chat gradcheck
+APPS := train chat gradcheck bpe
 APP_BIN := $(addprefix $(BUILD)/slmpt_,$(APPS))
 
 all: $(APP_BIN)

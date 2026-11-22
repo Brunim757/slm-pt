@@ -9,6 +9,7 @@
 #include "slmpt/parallel.hpp"
 #include "slmpt/sampling.hpp"
 #include "slmpt/serialization.hpp"
+#include "slmpt/tokenizer.hpp"
 
 using namespace slmpt;
 
@@ -28,8 +29,7 @@ int main(int argc, char** argv) {
   const float top_p = std::atof(argval(argc, argv, "--top-p", "0.9"));
   const float rep = std::atof(argval(argc, argv, "--rep", "1.15"));
   const int max_new = std::atoi(argval(argc, argv, "--max-new", "240"));
-  const int threads = std::atoi(
-      argval(argc, argv, "--threads", "0"));
+  const int threads = std::atoi(argval(argc, argv, "--threads", "0"));
   if (threads > 0) set_threads(threads);
 
   Config cfg;
@@ -39,12 +39,22 @@ int main(int argc, char** argv) {
   }
   cfg.batch = 1;  // inference
   Model model(cfg);
-  if (!load_checkpoint(model, path)) {
+  std::string blob;
+  if (!load_checkpoint(model, path, &blob)) {
     std::fprintf(stderr, "cannot load checkpoint: %s\n", path.c_str());
     return 1;
   }
 
-  std::printf("slm-pt chat (byte-level) — digite e pressione Enter. /sair para sair.\n");
+  BPETokenizer tok;
+  if (!blob.empty() && tok.load_from_string(blob)) {
+    // embedded tokenizer
+  } else if (!tok.load(cfg.tokenizer)) {
+    tok.set_merges({});
+    std::fprintf(stderr, "WARN: no tokenizer found, using raw bytes\n");
+  }
+
+  std::printf("slm-pt chat (BPE, vocab %d) — digite e pressione Enter. /sair para sair.\n",
+              tok.vocab_size());
   std::printf("modelo: %s (embd=%d layer=%d head=%d block=%d)\n\n", path.c_str(),
               cfg.n_embd, cfg.n_layer, cfg.n_head, cfg.block);
 
@@ -65,10 +75,10 @@ int main(int argc, char** argv) {
     if (line == "/sair" || line == "/exit") break;
     if (line.empty()) continue;
 
-    std::string prompt = "### Usuário:\n" + line + "\n\n### Assistente:\n";
-    std::string resp = generate(model, prompt, sp, rng);
-    const auto stop = resp.find("\n\n");
-    if (stop != std::string::npos) resp = resp.substr(0, stop);
+    const std::string prompt = "### Usuário:\n" + line + "\n\n### Assistente:\n";
+    std::string resp = generate(model, tok, prompt, sp, rng);
+    const auto nl = resp.find("\n\n");
+    if (nl != std::string::npos) resp = resp.substr(0, nl);
     std::printf("ia> %s\n\n", resp.c_str());
     std::fflush(stdout);
   }

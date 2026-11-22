@@ -23,7 +23,7 @@ add_library(slmpt_core STATIC
 target_include_directories(slmpt_core PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
 target_link_libraries(slmpt_core PUBLIC Threads::Threads)
 
-foreach(app train chat gradcheck)
+foreach(app train chat gradcheck bpe)
   add_executable(slmpt_${app} apps/${app}.cpp)
   target_link_libraries(slmpt_${app} PRIVATE slmpt_core)
 endforeach()

@@ -73,7 +73,28 @@ int main() {
     }
   }
 
-  std::printf("checked=%d  max_abs_err=%.3e  worst/tol=%.2f  bad=%d  =>  %s\n", checked,
-              max_abs, max_ratio, bad, bad == 0 ? "PASS" : "FAIL");
+  std::printf("checked=%d  max_abs_err=%.3e  worst/tol=%.2f  bad=%d\n", checked,
+              max_abs, max_ratio, bad);
+
+  // KV-cache consistency: sequential forward_token must reproduce the full
+  // (parallel) forward used in training.
+  {
+    std::vector<int> seq(T);
+    for (int i = 0; i < T; ++i) seq[i] = (i * 97 + 13) % 256;
+    model.forward(seq.data(), 1, T);
+    const int V = model.vocab();
+    std::vector<float> full(model.last_logits(), model.last_logits() + V);
+    model.reset_cache();
+    const float* lg = nullptr;
+    for (int i = 0; i < T; ++i) lg = model.forward_token(seq[i]);
+    double md = 0.0;
+    for (int v = 0; v < V; ++v)
+      md = std::max(md, static_cast<double>(std::fabs(full[v] - lg[v])));
+    const bool ok = md < 1e-3;
+    std::printf("kv-cache max|diff|=%.3e  =>  %s\n", md, ok ? "OK" : "FAIL");
+    if (!ok) bad++;
+  }
+
+  std::printf("RESULT => %s\n", bad == 0 ? "PASS" : "FAIL");
   return bad == 0 ? 0 : 1;
 }
