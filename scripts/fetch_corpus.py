@@ -145,24 +145,16 @@ def gen_smalltalk():
         "Portugal": "Lisboa", "Itália": "Roma", "Alemanha": "Berlim",
         "Espanha": "Madri", "Japão": "Tóquio", "Canadá": "Ottawa",
         "Estados Unidos": "Washington", "Inglaterra": "Londres",
-        "México": "Cidade do México", "Chile": "Santiago", "Peru": "Lima",
-        "Egito": "Cairo", "China": "Pequim", "Rússia": "Moscou",
-        "Uruguai": "Montevidéu", "Paraguai": "Assunção", "Bolívia": "La Paz",
-        "Colômbia": "Bogotá", "Venezuela": "Caracas", "Cuba": "Havana",
-        "Grécia": "Atenas", "Suécia": "Estocolmo", "Noruega": "Oslo",
-        "Dinamarca": "Copenhague", "Irlanda": "Dublin", "Áustria": "Viena",
-        "Suíça": "Berna", "Índia": "Nova Délhi", "Coreia do Sul": "Seul",
-        "Austrália": "Canberra", "Nigéria": "Abuja", "Quênia": "Nairóbi",
+        "Chile": "Santiago", "Peru": "Lima", "Egito": "Cairo",
+        "China": "Pequim", "Rússia": "Moscou", "Grécia": "Atenas",
+        "Suécia": "Estocolmo", "Índia": "Nova Délhi", "Austrália": "Canberra",
     }
     for c, cap in capitals.items():
-        add([f"qual é a capital do {c}?", f"qual e a capital do {c}?",
-             f"qual a capital do {c}?"],
-            [f"A capital do {c} é {cap}.", f"{cap}.", f"A capital é {cap}."])
+        add([f"qual é a capital do {c}?"], [f"A capital do {c} é {cap}."])
 
-    # determinate facts: simple math
-    for a, b in itertools.product(range(1, 21), range(1, 21)):
-        add([f"quanto é {a} mais {b}?", f"quanto e {a}+{b}?"],
-            [f"{a} mais {b} é {a + b}.", f"São {a + b}."])
+    # determinate facts: simple math (single phrasing, keeps facts crisp)
+    for a, b in itertools.product(range(1, 11), range(1, 11)):
+        add([f"quanto é {a} mais {b}?"], [f"{a} mais {b} é {a + b}."])
 
     # simple definitions / facts
     facts = {
@@ -216,6 +208,26 @@ def gen_smalltalk():
         ["Estude em blocos de 25 minutos e faça pausas curtas. Anote o que aprender."])
     add(["o que você quer fazer?", "quer conversar sobre o quê?"],
         ["Podemos falar sobre o que você gostar! Me diga o que está pensando."])
+    add(["conte outra piada", "sabe outra piada?", "quero rir, conte algo engraçado"],
+        ["Vou tentar: por que o computador foi ao médico? Porque estava com um vírus!",
+         "Aqui vai: o que o zero disse para o oito? Que cinto bonito!"])
+    add(["me diga uma curiosidade", "sabe algo curioso?", "conte uma curiosidade"],
+        ["As abelhas conseguem reconhecer rostos humanos. Curioso, não?",
+         "O mel nunca estraga: já encontraram potes comestíveis com milhares de anos."])
+    add(["o que é um algoritmo?", "me explica o que é um algoritmo"],
+        ["Um algoritmo é uma sequência de passos para resolver um problema."])
+    add(["o que é um planeta?", "me explica o que é um planeta"],
+        ["Um planeta é um corpo que gira em torno de uma estrela e não produz luz própria."])
+    add(["o que é a chuva ácida?", "me explica a chuva acida"],
+        ["A chuva ácida acontece quando poluentes no ar se misturam com a água das nuvens."])
+    add(["como se diz bom dia em inglês?", "bom dia em inglês?"],
+        ["Bom dia em inglês é 'good morning'."])
+    add(["como você faz isso?", "como você funciona?"],
+        ["Eu prevejo a próxima parte do texto com base em padrões que aprendi em português."])
+    add(["você erra às vezes?", "você comete erros?"],
+        ["Sim, eu erro! Sou uma IA pequena, então às vezes minhas respostas não fazem sentido."])
+    add(["você pode me ensinar algo?", "me ensina algo"],
+        ["Claro! Uma dica: para memorizar melhor, tente explicar o que aprendeu com suas palavras."])
 
     return pairs
 
