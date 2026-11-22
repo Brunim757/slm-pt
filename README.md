@@ -27,8 +27,10 @@ scripts/         fetch_corpus.py (baixa corpus PT e formata o diálogo)
   aprender a **responder**, não só a copiar texto.
 * **Dados** (`scripts/fetch_corpus.py`) misturam três fontes em português:
   `dominguesm/alpaca-data-pt-br` (instruções), conversas humanas reais do
-  `OpenAssistant/oasst1` (só as em `pt`) e um conjunto de **small talk** escrito à
-  mão, pra "olá", "tudo bem?" etc. terem resposta decente.
+  `OpenAssistant/oasst1` (só as `pt-BR`) e um conjunto **gerado** de small talk /
+  QA determinístico, pra "olá", "tudo bem?" etc. terem resposta decente. Os
+  pesos (`--chat-weight`, `--oasst-weight`) controlam quanto cada fonte pesa; e
+  `--no-net 1` gera o corpus de chat sem baixar nada.
 * **Decodificação**: temperatura + top-k + top-p + **penalidade de repetição** e
   parada automática em `### Usuário:`.
 
