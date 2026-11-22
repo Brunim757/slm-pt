@@ -26,4 +26,4 @@ if [ ! -x build/slmpt_chat ]; then
   echo "building ..."
   make -j"$(nproc)"
 fi
-exec ./build/slmpt_chat --model runs/model.bin --temp 0.8 --top-k 40
+exec ./build/slmpt_chat --model runs/model.bin --temp 0.3 --top-k 40 --top-p 0.9 --rep 1.15

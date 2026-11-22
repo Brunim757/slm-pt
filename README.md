@@ -66,8 +66,11 @@ Retomar de um checkpoint:
 ## Conversar
 
 ```bash
-./build/slmpt_chat --model runs/model.bin --temp 0.7 --top-k 40 --top-p 0.9 --rep 1.15
+./build/slmpt_chat --model runs/model.bin --temp 0.3 --top-k 40 --top-p 0.9 --rep 1.15
 ```
+
+Temperatura baixa (0,2–0,4) deixa as respostas mais precisas; temperatura mais
+alta (0,6–0,8) dá mais variação, mas inventa mais.
 
 ## Validar a matemática
 

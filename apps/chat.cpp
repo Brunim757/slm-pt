@@ -23,7 +23,7 @@ static const char* argval(int argc, char** argv, const char* key, const char* de
 
 int main(int argc, char** argv) {
   const std::string path = argval(argc, argv, "--model", "runs/model.bin");
-  const float temp = std::atof(argval(argc, argv, "--temp", "0.7"));
+  const float temp = std::atof(argval(argc, argv, "--temp", "0.3"));
   const int top_k = std::atoi(argval(argc, argv, "--top-k", "40"));
   const float top_p = std::atof(argval(argc, argv, "--top-p", "0.9"));
   const float rep = std::atof(argval(argc, argv, "--rep", "1.15"));
