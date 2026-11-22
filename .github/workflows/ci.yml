@@ -17,5 +17,18 @@ jobs:
         run: |
           cmake -B build -DCMAKE_BUILD_TYPE=Release
           cmake --build build -j"$(nproc)"
-      - name: Gradient check
+      - name: Gradient check (analytic vs finite differences + KV cache)
         run: ./build/slmpt_gradcheck
+      - name: BPE round-trip + end-to-end smoke
+        run: |
+          printf '### Usuário:\nOlá, tudo bem?\n\n### Assistente:\nTudo ótimo! E você?\n\n' > /tmp/s.txt
+          printf '### Usuário:\nQuem é você?\n\n### Assistente:\nSou uma IA pequena.\n\n' >> /tmp/s.txt
+          for i in $(seq 1 200); do cat /tmp/s.txt; done > /tmp/corpus.txt
+          ./build/slmpt_bpe --in /tmp/corpus.txt --out /tmp/tok.txt --ids /tmp/corpus.ids --vocab 512
+          mkdir -p /tmp/runs
+          ./build/slmpt_train --data /tmp/corpus.txt --ids /tmp/corpus.ids --tokenizer /tmp/tok.txt \
+            --out /tmp/runs --embd 32 --layer 2 --head 2 --block 32 --batch 4 \
+            --steps 10 --save-every 10 --sample-every 10 --threads 2
+          ./build/slmpt_eval --model /tmp/runs/model.bin --ids /tmp/corpus.ids --val 0.1 --threads 2
+          ./build/slmpt_quantize --model /tmp/runs/model.bin --ids /tmp/corpus.ids \
+            --bits 4 --group 32 --out /tmp/runs/model_q.bin --val 0.1 --threads 2

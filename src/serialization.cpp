@@ -38,7 +38,8 @@ bool peek_config(const std::string& path, Config& out) {
   FILE* f = std::fopen(path.c_str(), "rb");
   if (!f) return false;
   char magic[8];
-  if (std::fread(magic, 1, 8, f) != 8 || std::memcmp(magic, kMagic, 8) != 0) {
+  if (std::fread(magic, 1, 8, f) != 8 ||
+      (std::memcmp(magic, kMagic, 8) != 0 && std::memcmp(magic, "SLMQ0001", 8) != 0)) {
     std::fclose(f);
     return false;
   }

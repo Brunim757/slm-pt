@@ -1,6 +1,7 @@
 # Long training job (runs on GitHub-hosted runners).
 # Public repo => unlimited Actions minutes, so training can be chained across
-# runs: pass `resume_run=<previous run id>` to continue from its checkpoint.
+# runs: pass `resume_run=<previous run id>`, or `chain=1` to auto-resume from
+# the latest successful run (used by the nightly schedule).
 name: train
 
 on:
@@ -8,31 +9,34 @@ on:
     inputs:
       steps:
         description: "max training steps"
-        default: "100000"
+        default: "40000"
       max_minutes:
         description: "wall-clock budget (minutes)"
         default: "300"
       examples:
         description: "alpaca pairs limit (0 = all)"
-        default: "16000"
+        default: "40000"
       chat_weight:
         description: "repeat factor for generated chat"
-        default: "8"
+        default: "6"
       oasst_weight:
         description: "repeat factor for oasst pairs"
         default: "2"
+      bpe_vocab:
+        description: "BPE vocabulary size"
+        default: "8192"
       embd:
         description: "embedding dim"
-        default: "192"
+        default: "384"
       layer:
         description: "number of layers"
-        default: "5"
+        default: "8"
       head:
         description: "attention heads"
-        default: "6"
+        default: "8"
       block:
         description: "context length"
-        default: "192"
+        default: "256"
       batch:
         description: "batch size"
         default: "32"
@@ -42,6 +46,15 @@ on:
       resume_run:
         description: "run id to resume from (empty = fresh)"
         default: ""
+      chain:
+        description: "auto-resume from latest successful run (1 = yes)"
+        default: "0"
+      quant_bits:
+        description: "quantization bits for the report (8/4/2)"
+        default: "4"
+  schedule:
+    # Nightly continuation: keep improving the model without manual runs.
+    - cron: "0 3 * * *"
 
 permissions:
   contents: read
@@ -65,8 +78,8 @@ jobs:
       - name: Fetch Portuguese corpus
         run: |
           python3 scripts/fetch_corpus.py --out data/corpus.txt \
-            --limit "${{ github.event.inputs.examples || '16000' }}" \
-            --chat-weight "${{ github.event.inputs.chat_weight || '8' }}" \
+            --limit "${{ github.event.inputs.examples || '40000' }}" \
+            --chat-weight "${{ github.event.inputs.chat_weight || '6' }}" \
             --oasst-weight "${{ github.event.inputs.oasst_weight || '2' }}"
 
       - name: Build
@@ -74,48 +87,74 @@ jobs:
           cmake -B build -DCMAKE_BUILD_TYPE=Release
           cmake --build build -j"$(nproc)"
 
+      - name: Train BPE tokenizer
+        run: |
+          ./build/slmpt_bpe --in data/corpus.txt --out data/tokenizer.txt \
+            --ids data/corpus.ids --vocab "${{ github.event.inputs.bpe_vocab || '8192' }}"
+
       - name: Gradient check
         run: ./build/slmpt_gradcheck
 
       - name: Smoke test (fast)
         run: |
           mkdir -p runs/smoke
-          ./build/slmpt_train --data data/corpus.txt --out runs/smoke \
+          ./build/slmpt_train --data data/corpus.txt --ids data/corpus.ids \
+            --tokenizer data/tokenizer.txt --out runs/smoke \
             --embd 64 --layer 2 --head 4 --block 64 --batch 8 \
-            --steps 30 --save-every 30 --sample-every 30 --threads 4
+            --steps 20 --save-every 20 --sample-every 20 --threads 4
 
       - name: Resume previous checkpoint (optional)
-        if: ${{ github.event.inputs.resume_run != '' }}
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
+          RESUME_RUN="${{ github.event.inputs.resume_run }}"
+          if [ -z "$RESUME_RUN" ] && { [ "${{ github.event.inputs.chain }}" = "1" ] || [ "${{ github.event_name }}" = "schedule" ]; }; then
+            RESUME_RUN="$(gh run list --workflow=train.yml --status success --limit 1 \
+              --json databaseId --jq '.[0].databaseId // empty')"
+          fi
           mkdir -p runs
-          gh run download "${{ github.event.inputs.resume_run }}" \
-            --name slm-pt-run -D runs || \
-            gh run download "${{ github.event.inputs.resume_run }}" -D runs
-          find runs -name model.bin
+          if [ -n "$RESUME_RUN" ]; then
+            echo "resuming from run $RESUME_RUN"
+            gh run download "$RESUME_RUN" --name slm-pt-run -D runs || \
+              gh run download "$RESUME_RUN" -D runs || true
+            find runs -name model.bin
+          fi
 
       - name: Train
         run: |
           mkdir -p runs
           RESUME=""
           if [ -f runs/model.bin ]; then RESUME="--resume runs/model.bin"; fi
-          ./build/slmpt_train --data data/corpus.txt --out runs \
-            --embd ${{ github.event.inputs.embd || '192' }} \
-            --layer ${{ github.event.inputs.layer || '5' }} \
-            --head ${{ github.event.inputs.head || '6' }} \
-            --block ${{ github.event.inputs.block || '192' }} \
+          ./build/slmpt_train --data data/corpus.txt --ids data/corpus.ids \
+            --tokenizer data/tokenizer.txt --out runs \
+            --embd ${{ github.event.inputs.embd || '384' }} \
+            --layer ${{ github.event.inputs.layer || '8' }} \
+            --head ${{ github.event.inputs.head || '8' }} \
+            --block ${{ github.event.inputs.block || '256' }} \
             --batch ${{ github.event.inputs.batch || '32' }} \
             --lr ${{ github.event.inputs.lr || '3e-4' }} \
-            --steps ${{ github.event.inputs.steps || '100000' }} \
+            --steps ${{ github.event.inputs.steps || '40000' }} \
             --max-minutes ${{ github.event.inputs.max_minutes || '300' }} \
-            --save-every 500 --sample-every 250 --threads "$(nproc)" $RESUME
+            --save-every 500 --sample-every 500 --threads "$(nproc)" $RESUME
 
-      - name: Upload checkpoint + samples
+      - name: Evaluate (held-out perplexity)
+        run: |
+          ./build/slmpt_eval --model runs/model.bin --ids data/corpus.ids \
+            --data data/corpus.txt --val 0.02 --threads "$(nproc)"
+
+      - name: Compression report
+        run: |
+          ./build/slmpt_quantize --model runs/model.bin --ids data/corpus.ids \
+            --data data/corpus.txt --bits ${{ github.event.inputs.quant_bits || '4' }} \
+            --group 64 --out runs/model_q.bin --val 0.02 --threads "$(nproc)"
+
+      - name: Upload checkpoint + reports
         uses: actions/upload-artifact@v4
         with:
           name: slm-pt-run
           path: |
             runs/model.bin
+            runs/model_q.bin
             runs/samples.txt
+            data/tokenizer.txt
           if-no-files-found: warn

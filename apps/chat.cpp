@@ -7,6 +7,8 @@
 #include "slmpt/config.hpp"
 #include "slmpt/model.hpp"
 #include "slmpt/parallel.hpp"
+#include "slmpt/quant.hpp"
+#include "slmpt/rag.hpp"
 #include "slmpt/sampling.hpp"
 #include "slmpt/serialization.hpp"
 #include "slmpt/tokenizer.hpp"
@@ -40,7 +42,8 @@ int main(int argc, char** argv) {
   cfg.batch = 1;  // inference
   Model model(cfg);
   std::string blob;
-  if (!load_checkpoint(model, path, &blob)) {
+  const bool quantized = is_quantized(path);
+  if (quantized ? !load_quantized(path, model, &blob) : !load_checkpoint(model, path, &blob)) {
     std::fprintf(stderr, "cannot load checkpoint: %s\n", path.c_str());
     return 1;
   }
@@ -67,6 +70,18 @@ int main(int argc, char** argv) {
   sp.max_new = max_new;
   sp.stop = "\n\n### Usuário:";
 
+  // Optional local retrieval (RAG): ground answers in your own files.
+  RagIndex rag;
+  bool use_rag = false;
+  const std::string rag_path = argval(argc, argv, "--rag", "");
+  const int rag_topk = std::atoi(argval(argc, argv, "--rag-topk", "3"));
+  if (!rag_path.empty()) {
+    if (load_index(rag_path, rag))
+      use_rag = true;
+    else
+      std::fprintf(stderr, "WARN: cannot load rag index %s\n", rag_path.c_str());
+  }
+
   std::string line;
   while (true) {
     std::printf("você> ");
@@ -75,7 +90,18 @@ int main(int argc, char** argv) {
     if (line == "/sair" || line == "/exit") break;
     if (line.empty()) continue;
 
-    const std::string prompt = "### Usuário:\n" + line + "\n\n### Assistente:\n";
+    std::string context;
+    if (use_rag) {
+      std::vector<float> qe;
+      embed_text(model, tok, line, qe);
+      std::vector<int> idx;
+      std::vector<float> score;
+      retrieve(rag, qe, rag_topk, idx, score);
+      for (int i : idx) context += rag.texts[i] + "\n";
+    }
+
+    const std::string prompt = "### Usuário:\n" + context + line +
+                               "\n\n### Assistente:\n";
     std::string resp = generate(model, tok, prompt, sp, rng);
     const auto nl = resp.find("\n\n");
     if (nl != std::string::npos) resp = resp.substr(0, nl);

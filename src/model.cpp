@@ -8,8 +8,40 @@
 
 #include "slmpt/parallel.hpp"
 
+#if defined(__ARM_NEON)
+#include <arm_neon.h>
+#elif defined(__AVX2__)
+#include <immintrin.h>
+#endif
+
 namespace slmpt {
 namespace {
+
+// Vectorized dot product (falls back to a scalar loop everywhere else).
+inline float dot_f32(const float* a, const float* b, int n) {
+#if defined(__ARM_NEON)
+  float32x4_t acc = vdupq_n_f32(0.f);
+  int i = 0;
+  for (; i + 4 <= n; i += 4) acc = vmlaq_f32(acc, vld1q_f32(a + i), vld1q_f32(b + i));
+  float s = vaddvq_f32(acc);
+  for (; i < n; ++i) s += a[i] * b[i];
+  return s;
+#elif defined(__AVX2__)
+  __m256 acc = _mm256_setzero_ps();
+  int i = 0;
+  for (; i + 8 <= n; i += 8)
+    acc = _mm256_fmadd_ps(_mm256_loadu_ps(a + i), _mm256_loadu_ps(b + i), acc);
+  float tmp[8];
+  _mm256_storeu_ps(tmp, acc);
+  float s = tmp[0] + tmp[1] + tmp[2] + tmp[3] + tmp[4] + tmp[5] + tmp[6] + tmp[7];
+  for (; i < n; ++i) s += a[i] * b[i];
+  return s;
+#else
+  float s = 0.f;
+  for (int i = 0; i < n; ++i) s += a[i] * b[i];
+  return s;
+#endif
+}
 
 // y[rows,out] = x[rows,in] @ W[out,in]^T   (W row-major [out][in])
 void linear_fwd(const float* x, const float* W, float* y, int rows, int in, int out) {
@@ -19,9 +51,7 @@ void linear_fwd(const float* x, const float* W, float* y, int rows, int in, int 
       float* yr = y + static_cast<size_t>(r) * out;
       for (int o = 0; o < out; ++o) {
         const float* wo = W + static_cast<size_t>(o) * in;
-        float acc = 0.f;
-        for (int i = 0; i < in; ++i) acc += xr[i] * wo[i];
-        yr[o] = acc;
+        yr[o] = dot_f32(xr, wo, in);
       }
     }
   });
@@ -347,8 +377,7 @@ void Model::attn_forward(LayerActs& A, int B, int T) {
         for (int j = 0; j <= i; ++j) {
           const int rj = b * T + j;
           const float* kj = A.k.data() + static_cast<size_t>(rj) * C + h * hd;
-          float s = 0.f;
-          for (int d = 0; d < hd; ++d) s += qi[d] * kj[d];
+          float s = dot_f32(qi, kj, hd);
           s *= scale;
           pr[i * T + j] = s;
           if (s > mx) mx = s;
@@ -394,9 +423,7 @@ void Model::attn_backward(LayerActs& A, int B, int T, const float* dctx,
         for (int j = 0; j <= i; ++j) {
           const int rj = b * T + j;
           const float* vj = A.v.data() + static_cast<size_t>(rj) * C + h * hd;
-          float s = 0.f;
-          for (int d = 0; d < hd; ++d) s += dci[d] * vj[d];
-          dp[j] = s;
+          dp[j] = dot_f32(dci, vj, hd);
         }
         for (int j = 0; j <= i; ++j) {
           const int rj = b * T + j;
@@ -599,8 +626,7 @@ const float* Model::forward_token(int token) {
       float mx = -1e30f;
       for (int j = 0; j <= p; ++j) {
         const float* kj = cache_k_.data() + (static_cast<size_t>(l) * T_ + j) * C + h * hd;
-        float s = 0.f;
-        for (int d = 0; d < hd; ++d) s += qi[d] * kj[d];
+        float s = dot_f32(qi, kj, hd);
         s *= scale;
         sc[j] = s;
         if (s > mx) mx = s;
