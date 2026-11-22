@@ -43,18 +43,18 @@ void pack_read(FILE* f, std::vector<int>& q, size_t n, int bits) {
   q.resize(n);
   if (bits == 8) {
     std::vector<int8_t> b(n);
-    std::fread(b.data(), 1, n, f);
+    (void)std::fread(b.data(), 1, n, f);
     for (size_t i = 0; i < n; ++i) q[i] = b[i];
   } else if (bits == 4) {
     std::vector<uint8_t> b((n + 1) / 2);
-    std::fread(b.data(), 1, b.size(), f);
+    (void)std::fread(b.data(), 1, b.size(), f);
     for (size_t i = 0; i < n; ++i) {
       uint8_t v = (i % 2 == 0) ? (b[i / 2] & 0xF) : (b[i / 2] >> 4);
       q[i] = (v >= 8) ? v - 16 : v;
     }
   } else {
     std::vector<uint8_t> b((n + 3) / 4);
-    std::fread(b.data(), 1, b.size(), f);
+    (void)std::fread(b.data(), 1, b.size(), f);
     for (size_t i = 0; i < n; ++i) {
       uint8_t v = (b[i / 4] >> (2 * (i % 4))) & 0x3;
       q[i] = (v >= 2) ? static_cast<int>(v) - 4 : v;
@@ -154,13 +154,13 @@ bool load_quantized(const std::string& path, Model& model, std::string* tokenize
     return false;
   }
   int32_t hdr[6];
-  std::fread(hdr, sizeof(int32_t), 6, f);
+  (void)std::fread(hdr, sizeof(int32_t), 6, f);
   int32_t meta[2];
-  std::fread(meta, sizeof(int32_t), 2, f);
+  (void)std::fread(meta, sizeof(int32_t), 2, f);
   const int bits = meta[0], group = meta[1];
   const int qmax = qmax_for(bits);
   int64_t np = 0;
-  std::fread(&np, sizeof(int64_t), 1, f);
+  (void)std::fread(&np, sizeof(int64_t), 1, f);
   if (np != static_cast<int64_t>(model.params().size())) {
     std::fclose(f);
     return false;
@@ -168,21 +168,21 @@ bool load_quantized(const std::string& path, Model& model, std::string* tokenize
   std::vector<int> q;
   for (Param* p : model.params()) {
     int64_t sz = 0;
-    std::fread(&sz, sizeof(int64_t), 1, f);
+    (void)std::fread(&sz, sizeof(int64_t), 1, f);
     int32_t flags = 0;
-    std::fread(&flags, sizeof(int32_t), 1, f);
+    (void)std::fread(&flags, sizeof(int32_t), 1, f);
     if (sz != static_cast<int64_t>(p->data.size())) {
       std::fclose(f);
       return false;
     }
     if (!flags) {
-      std::fread(p->data.data(), sizeof(float), p->data.size(), f);
+      (void)std::fread(p->data.data(), sizeof(float), p->data.size(), f);
       continue;
     }
     int32_t ng = 0;
-    std::fread(&ng, sizeof(int32_t), 1, f);
+    (void)std::fread(&ng, sizeof(int32_t), 1, f);
     std::vector<float> scales(ng);
-    std::fread(scales.data(), sizeof(float), scales.size(), f);
+    (void)std::fread(scales.data(), sizeof(float), scales.size(), f);
     pack_read(f, q, p->data.size(), bits);
     for (size_t i = 0; i < p->data.size(); ++i) {
       const size_t g = i / group;

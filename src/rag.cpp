@@ -100,17 +100,17 @@ bool load_index(const std::string& path, RagIndex& index) {
   }
   int32_t dim = 0;
   int64_t count = 0;
-  std::fread(&dim, sizeof(int32_t), 1, f);
-  std::fread(&count, sizeof(int64_t), 1, f);
+  (void)std::fread(&dim, sizeof(int32_t), 1, f);
+  (void)std::fread(&count, sizeof(int64_t), 1, f);
   index.dim = dim;
   index.texts.assign(static_cast<size_t>(count), std::string());
   index.emb.assign(static_cast<size_t>(count), std::vector<float>(dim, 0.f));
   for (int64_t i = 0; i < count; ++i) {
     int64_t tl = 0;
-    std::fread(&tl, sizeof(int64_t), 1, f);
+    (void)std::fread(&tl, sizeof(int64_t), 1, f);
     index.texts[i].resize(static_cast<size_t>(tl));
-    if (tl > 0) std::fread(&index.texts[i][0], 1, static_cast<size_t>(tl), f);
-    std::fread(index.emb[i].data(), sizeof(float), dim, f);
+    if (tl > 0) (void)std::fread(&index.texts[i][0], 1, static_cast<size_t>(tl), f);
+    (void)std::fread(index.emb[i].data(), sizeof(float), dim, f);
   }
   std::fclose(f);
   return true;
