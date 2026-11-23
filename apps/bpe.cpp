@@ -102,7 +102,7 @@ int main(int argc, char** argv) {
     uint64_t best_key = 0;
     long long best = 1;
     for (const auto& kv : counts) {
-      if (kv.second > best) {
+      if (kv.second > best || (kv.second == best && kv.first < best_key)) {
         best = kv.second;
         best_key = kv.first;
       }

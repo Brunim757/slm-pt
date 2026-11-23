@@ -105,6 +105,18 @@ int main(int argc, char** argv) {
               get_threads(), cfg.rope_theta);
 
   if (!cfg.resume.empty()) {
+    // Safety lock: a resume is only valid if the tokenizer used to build the
+    // checkpoint is byte-identical to ours. Otherwise token ids would decode to
+    // different text and the weights would be silently corrupted.
+    std::string prev_tok;
+    if (read_checkpoint_tokenizer(cfg.resume, prev_tok) && !prev_tok.empty() &&
+        prev_tok != tok.to_string()) {
+      std::fprintf(stderr,
+                   "FATAL: tokenizer mismatch resuming from %s; refusing to corrupt "
+                   "weights (rebuild with the same BPE vocabulary)\n",
+                   cfg.resume.c_str());
+      return 2;
+    }
     if (load_checkpoint(model, cfg.resume))
       std::printf("resumed from %s\n", cfg.resume.c_str());
     else

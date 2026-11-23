@@ -58,6 +58,53 @@ bool peek_config(const std::string& path, Config& out) {
   return true;
 }
 
+bool read_checkpoint_tokenizer(const std::string& path, std::string& out) {
+  FILE* f = std::fopen(path.c_str(), "rb");
+  if (!f) return false;
+  char magic[8];
+  if (std::fread(magic, 1, 8, f) != 8 || std::memcmp(magic, kMagic, 8) != 0) {
+    std::fclose(f);
+    return false;
+  }
+  int32_t hdr[6];
+  if (std::fread(hdr, sizeof(int32_t), 6, f) != 6) {
+    std::fclose(f);
+    return false;
+  }
+  int64_t np = 0;
+  if (std::fread(&np, sizeof(int64_t), 1, f) != 1 || np < 0) {
+    std::fclose(f);
+    return false;
+  }
+  // Skip every parameter: each is a length-prefixed fp32 blob. Seeking past the
+  // bytes keeps this cheap even for large checkpoints.
+  for (int64_t i = 0; i < np; ++i) {
+    int64_t sz = 0;
+    if (std::fread(&sz, sizeof(int64_t), 1, f) != 1 || sz < 0) {
+      std::fclose(f);
+      return false;
+    }
+    if (std::fseek(f, static_cast<long>(sz * static_cast<int64_t>(sizeof(float))),
+                   SEEK_CUR) != 0) {
+      std::fclose(f);
+      return false;
+    }
+  }
+  int64_t tl = 0;
+  if (std::fread(&tl, sizeof(int64_t), 1, f) != 1 || tl <= 0) {
+    std::fclose(f);
+    return false;
+  }
+  out.resize(static_cast<size_t>(tl));
+  if (std::fread(&out[0], 1, static_cast<size_t>(tl), f) != static_cast<size_t>(tl)) {
+    out.clear();
+    std::fclose(f);
+    return false;
+  }
+  std::fclose(f);
+  return true;
+}
+
 bool load_checkpoint(Model& model, const std::string& path, std::string* tokenizer_blob) {
   FILE* f = std::fopen(path.c_str(), "rb");
   if (!f) return false;
