@@ -31,6 +31,12 @@ on:
       oasst_weight:
         description: "repeat factor for oasst pairs"
         default: "2"
+      wiki:
+        description: "include Wikipedia raw prose (0/1)"
+        default: "1"
+      wiki_chars:
+        description: "max raw-text characters (0 = whole shard)"
+        default: "40000000"
       bpe_vocab:
         description: "BPE vocabulary size"
         default: "4096"
@@ -96,7 +102,9 @@ jobs:
             --canarim-limit "${{ github.event.inputs.canarim_limit || '30000' }}" \
             --canarim-max-chars "${{ github.event.inputs.canarim_max_chars || '800' }}" \
             --chat-weight "${{ github.event.inputs.chat_weight || '12' }}" \
-            --oasst-weight "${{ github.event.inputs.oasst_weight || '2' }}"
+            --oasst-weight "${{ github.event.inputs.oasst_weight || '2' }}" \
+            --wiki "${{ github.event.inputs.wiki || '1' }}" \
+            --wiki-chars "${{ github.event.inputs.wiki_chars || '40000000' }}"
 
       - name: Build
         run: |

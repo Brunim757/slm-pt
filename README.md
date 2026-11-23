@@ -30,7 +30,7 @@ scripts/         fetch_corpus.py (baixa o corpus PT) e get_model.sh
 * **Treino**: cross-entropy + AdamW (weight decay desacoplado, clip de norma),
   warmup + cosine, checkpoints, amostras periódicas.
 * **Inferência**: **KV cache** incremental (cada passo novo é O(T), não O(T²)),
-  temperatura + top-k + top-p + penalidade de repetição, parada em `### Usuário:`.
+  temperatura + top-k + top-p + penalidade de repetição, parada em `<|end|>`.
 * **Compressão**: quantização simétrica por grupo (8/4/2 bits) dos tensores de
   peso, mantendo as normas em fp32; relatório de tamanho × perplexidade.
 * **RAG local**: indexa seus arquivos usando o estado oculto médio do modelo e

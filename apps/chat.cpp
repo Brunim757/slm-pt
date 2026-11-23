@@ -68,7 +68,7 @@ int main(int argc, char** argv) {
   sp.top_p = top_p;
   sp.repetition_penalty = rep;
   sp.max_new = max_new;
-  sp.stop = "\n\n### Usuário:";
+  sp.stop = "<|end|>";
 
   // Optional local retrieval (RAG): ground answers in your own files.
   RagIndex rag;
@@ -100,11 +100,9 @@ int main(int argc, char** argv) {
       for (int i : idx) context += rag.texts[i] + "\n";
     }
 
-    const std::string prompt = "### Usuário:\n" + context + line +
-                               "\n\n### Assistente:\n";
+    const std::string prompt = "<|user|>\n" + context + line +
+                               "\n<|assistant|>\n";
     std::string resp = generate(model, tok, prompt, sp, rng);
-    const auto nl = resp.find("\n\n");
-    if (nl != std::string::npos) resp = resp.substr(0, nl);
     std::printf("ia> %s\n\n", resp.c_str());
     std::fflush(stdout);
   }

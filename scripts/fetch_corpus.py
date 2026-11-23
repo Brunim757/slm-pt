@@ -1,18 +1,26 @@
 #!/usr/bin/env python3
-"""Build the Portuguese chat corpus.
+"""Build the Portuguese corpus (raw prose + chat).
 
-Sources (all mixed into `### Usuário: / ### Assistente:` blocks):
+Two kinds of data, both written into one text stream that the C++ BPE tool
+tokenizes:
 
-* a large generated set of **small talk / simple determinate QA** that makes
-  greetings and casual questions map to sensible short replies;
-* `dominguesm/Canarim-Instruct-PTBR-Dataset` — 300k+ Portuguese instructions
-  (the main bulk, far richer than the translated alpaca set);
-* `dominguesm/alpaca-data-pt-br` — extra instruction/answer pairs (general);
-* `OpenAssistant/oasst1` — real human Portuguese (pt-BR) conversations.
+1. **Raw prose** — Portuguese Wikipedia articles (plain text).  This teaches the
+   *language itself*: narration, description, argument, text that is not
+   addressed to anyone.  Without it the model only ever sees the
+   `<|user|> / <|assistant|>` shape and never learns to understand or
+   continue ordinary text (it becomes a responder, not a language model).
+2. **Chat** — instruction/answer pairs in ChatML-style `<|user|>` / `<|assistant|>`
+   blocks (each turn ends with `<|end|>`):
 
-The generator exists because the instruction corpora alone teach a *generic
-answer style*: the reply barely depends on the question. Few-shot chat data with
-strong question -> answer coupling is what makes a tiny model actually respond.
+   * a large generated set of **small talk / simple determinate QA** that makes
+     greetings and casual questions map to sensible short replies;
+   * `dominguesm/Canarim-Instruct-PTBR-Dataset` — 300k+ Portuguese instructions;
+   * `dominguesm/alpaca-data-pt-br` — extra instruction/answer pairs (general);
+   * `OpenAssistant/oasst1` — real human Portuguese (pt-BR) conversations.
+
+The small-talk generator exists because the instruction corpora alone teach a
+*generic answer style*: the reply barely depends on the question.  Few-shot chat
+data with strong question -> answer coupling is what makes a tiny model respond.
 """
 import argparse
 import itertools
@@ -29,6 +37,8 @@ ALPACA_FALLBACK = "data/train-00000-of-00001-63604ec441480f0e.parquet"
 CANARIM = "dominguesm/Canarim-Instruct-PTBR-Dataset"
 OASST = "OpenAssistant/oasst1"
 OASST_FALLBACK = "data/train-00000-of-00001-b42a775f407cee45.parquet"
+WIKI = "wikimedia/wikipedia"
+WIKI_CONFIG = "20231101.pt"  # Portuguese dump; shards live under this subdir
 PT_LANGS = {"pt", "pt-BR", "pt_PT", "pt-br"}
 
 
@@ -53,16 +63,40 @@ def find_file(dataset, suffix, fallback):
     return fallback
 
 
+def find_shard(dataset, config):
+    """First train parquet inside a config subdir (e.g. `20231101.pt/`).
+
+    `find_file` cannot be used here: the multi-lingual dumps put every language
+    in its own subdir, so a plain `.parquet` match could land on the wrong
+    language.  Configs are numbered; the shards are small enough to stream.
+    """
+    try:
+        with open_url(f"https://huggingface.co/api/datasets/{dataset}", timeout=60) as r:
+            info = json.load(r)
+        files = [s["rfilename"] for s in info.get("siblings", [])]
+        hits = [f for f in files
+                if f.startswith(config + "/") and f.endswith(".parquet")
+                and "train" in f.lower()]
+        hits.sort()
+        if hits:
+            return hits[0]
+    except Exception as exc:  # noqa: BLE001
+        print(f"  (could not query {dataset}: {exc})", file=sys.stderr)
+    return ""
+
+
 def download(url, path):
     with open_url(url) as r, open(path, "wb") as f:
         shutil.copyfileobj(r, f, length=1 << 20)
 
 
 def fmt(instr, inp, out):
-    parts = ["### Usuário:\n", instr, "\n"]
+    # ChatML-style: role markers are reserved special tokens (atomic in the BPE),
+    # and every turn closes with <|end|>.
+    parts = ["<|user|>\n", instr, "\n"]
     if inp:
         parts.append(inp + "\n")
-    parts += ["\n### Assistente:\n", out, "\n\n"]
+    parts += ["<|assistant|>\n", out, "\n<|end|>\n"]
     return "".join(parts)
 
 
@@ -255,6 +289,14 @@ def main():
     ap.add_argument("--oasst-weight", type=int, default=2, help="repeat oasst pairs")
     ap.add_argument("--oasst", type=int, default=1, help="include oasst1 pt pairs (0/1)")
     ap.add_argument("--oasst-max", type=int, default=8000, help="max oasst pairs")
+    ap.add_argument("--wiki", type=int, default=1,
+                    help="include Wikipedia raw prose (0/1)")
+    ap.add_argument("--wiki-config", default=WIKI_CONFIG,
+                    help="Wikipedia dump config, e.g. 20231101.pt")
+    ap.add_argument("--wiki-limit", type=int, default=0,
+                    help="max wiki articles (0 = as many as fit the char budget)")
+    ap.add_argument("--wiki-chars", type=int, default=40000000,
+                    help="max raw-text characters (0 = entire shard)")
     ap.add_argument("--no-net", type=int, default=0, help="skip downloads (chat only)")
     ap.add_argument("--seed", type=int, default=1234)
     args = ap.parse_args()
@@ -266,7 +308,8 @@ def main():
 
     chat = gen_smalltalk()
     written = 0
-    n_st = n_alp = n_oas = n_can = 0
+    n_st = n_alp = n_oas = n_can = n_wiki = 0
+    raw_chars = 0
     tmpdir = tempfile.mkdtemp()
     with open(args.out, "w", encoding="utf-8") as f:
         # 1) generated chat (weighted, shuffled so frames spread across the file)
@@ -378,10 +421,77 @@ def main():
                     print(f"  (oasst skipped: {exc})", file=sys.stderr)
             print(f"  oasst(pt): {n_oas} pairs", file=sys.stderr)
 
+            # 4) raw Portuguese prose — the *language* stage.  Articles are
+            #    streamed row-group by row-group and stop as soon as the char
+            #    budget is met, so we never decode the whole (~200 MB) shard in
+            #    memory.  Documents are separated by a blank line.
+            if args.wiki:
+                shard = find_shard(WIKI, args.wiki_config)
+                if not shard:
+                    print("  (wiki skipped: no shard found)", file=sys.stderr)
+                else:
+                    url = f"https://huggingface.co/datasets/{WIKI}/resolve/main/{shard}"
+                    path = os.path.join(tmpdir, "wiki.parquet")
+                    print(f"downloading {shard} ...", file=sys.stderr)
+                    try:
+                        download(url, path)
+                        rows = []
+                        chars = 0
+                        for batch in pq.ParquetFile(path).iter_batches(
+                                batch_size=512, columns=["text"]):
+                            for tx in batch.column("text").to_pylist():
+                                tx = (tx or "").strip()
+                                if len(tx) < 200:      # skip stubs / list fragments
+                                    continue
+                                rows.append(tx)
+                                chars += len(tx)
+                                if args.wiki_limit and len(rows) >= args.wiki_limit:
+                                    break
+                            if args.wiki_limit and len(rows) >= args.wiki_limit:
+                                break
+                            if args.wiki_chars and chars >= args.wiki_chars:
+                                break
+                        random.shuffle(rows)
+                        for tx in rows:
+                            f.write("<|text|>\n")
+                            f.write(tx)
+                            f.write("\n<|end|>\n")
+                            written += 1
+                            n_wiki += 1
+                            raw_chars += len(tx)
+                    except Exception as exc:  # noqa: BLE001
+                        print(f"  (wiki skipped: {exc})", file=sys.stderr)
+                print(f"  wiki: {n_wiki} articles ({raw_chars / 1048576:.1f} MB raw)",
+                      file=sys.stderr)
+
     shutil.rmtree(tmpdir, ignore_errors=True)
     size = os.path.getsize(args.out)
     print(f"wrote {written} examples ({size / 1048576:.2f} MB) to {args.out} "
-          f"[chat={n_st} canarim={n_can} alpaca={n_alp} oasst={n_oas}]", file=sys.stderr)
+          f"[chat={n_st} canarim={n_can} alpaca={n_alp} oasst={n_oas} "
+          f"wiki={n_wiki}]", file=sys.stderr)
+
+    # Hard corpus check: every chat turn must be complete and paired.  Raw prose
+    # has no markers, so a mismatch means the template broke and the run must
+    # fail here instead of spending hours training on a corrupted stream.
+    with open(args.out, "r", encoding="utf-8") as f:
+        text = f.read()
+    n_user = text.count("<|user|>")
+    n_asst = text.count("<|assistant|>")
+    n_end = text.count("<|end|>")
+    n_txt = text.count("<|text|>")
+    # empty user turn = <|user|> immediately followed by <|assistant|>; empty
+    # answer = <|assistant|> immediately followed by <|end|>.
+    n_empty = text.count("<|user|>\n<|assistant|>") + text.count("<|assistant|>\n<|end|>")
+    if n_user != n_asst or n_empty:
+        sys.exit(f"corpus check FAILED: user={n_user} assistant={n_asst} "
+                 f"empty_turns={n_empty}")
+    if n_end != n_user + n_txt:
+        sys.exit(f"corpus check FAILED: end-token count {n_end} != "
+                 f"user {n_user} + text {n_txt}")
+    if args.wiki and not args.no_net and n_txt == 0:
+        sys.exit("corpus check FAILED: no raw prose (wiki) was included")
+    print(f"corpus check OK: {n_user} chat pairs, {n_txt} raw docs, "
+          f"{n_end} <|end|>, no empty turns", file=sys.stderr)
 
 
 if __name__ == "__main__":

@@ -13,7 +13,7 @@ struct SampleParams {
   float top_p = 0.95f;
   float repetition_penalty = 1.15f;
   int repetition_window = 128;
-  std::string stop = "\n\n### Usuário:";
+  std::string stop = "<|end|>";
   int max_new = 240;
 };
 

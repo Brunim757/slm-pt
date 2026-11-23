@@ -14,8 +14,14 @@ inline uint64_t pair_key(int a, int b) {
 }
 }  // namespace
 
+const std::vector<std::string>& BPETokenizer::default_specials() {
+  static const std::vector<std::string> kSpecials = {
+      "<|user|>", "<|assistant|>", "<|end|>", "<|text|>"};
+  return kSpecials;
+}
+
 void BPETokenizer::rebuild() {
-  id_bytes_.assign(kBase + merges_.size(), std::string());
+  id_bytes_.assign(kBase + merges_.size() + specials_.size(), std::string());
   for (int i = 0; i < kBase; ++i) id_bytes_[i] = std::string(1, static_cast<char>(i));
   rank_.clear();
   rank_.reserve(merges_.size() * 2);
@@ -25,10 +31,17 @@ void BPETokenizer::rebuild() {
     id_bytes_[id] = id_bytes_[a] + id_bytes_[b];
     rank_[pair_key(a, b)] = static_cast<int>(i);
   }
+  for (size_t k = 0; k < specials_.size(); ++k)
+    id_bytes_[static_cast<size_t>(special_id(static_cast<int>(k)))] = specials_[k];
 }
 
 void BPETokenizer::set_merges(std::vector<std::pair<int, int>> merges) {
   merges_ = std::move(merges);
+  rebuild();
+}
+
+void BPETokenizer::set_specials(std::vector<std::string> specials) {
+  specials_ = std::move(specials);
   rebuild();
 }
 
@@ -47,7 +60,19 @@ bool BPETokenizer::load_from_string(const std::string& blob) {
     if (!(in >> a >> b)) return false;
     merges.emplace_back(a, b);
   }
-  if (vocab != kBase + n_merge) return false;
+  std::vector<std::string> specials;
+  if (version >= 2) {  // v2 carries reserved control tokens
+    int n_spec = 0;
+    if (!(in >> magic >> n_spec) || magic != "specials") return false;
+    specials.reserve(n_spec);
+    for (int i = 0; i < n_spec; ++i) {
+      std::string s;
+      if (!(in >> s)) return false;
+      specials.push_back(std::move(s));
+    }
+  }
+  if (vocab != kBase + n_merge + static_cast<int>(specials.size())) return false;
+  specials_ = std::move(specials);
   set_merges(std::move(merges));
   return true;
 }
@@ -66,13 +91,18 @@ bool BPETokenizer::load(const std::string& path) {
 std::string BPETokenizer::to_string() const {
   std::string s;
   s.reserve(merges_.size() * 12 + 64);
-  s += "SLMPTBPE 1\n";
+  s += "SLMPTBPE 2\n";
   s += "vocab " + std::to_string(vocab_size()) + "\n";
   s += "merges " + std::to_string(merges_.size()) + "\n";
   for (const auto& m : merges_) {
     s += std::to_string(m.first);
     s += ' ';
     s += std::to_string(m.second);
+    s += '\n';
+  }
+  s += "specials " + std::to_string(specials_.size()) + "\n";
+  for (const std::string& sp : specials_) {
+    s += sp;
     s += '\n';
   }
   return s;
@@ -102,7 +132,7 @@ std::vector<std::string> BPETokenizer::pretokenize(const std::string& text) {
   return out;
 }
 
-std::vector<int> BPETokenizer::encode(const std::string& text) const {
+std::vector<int> BPETokenizer::encode_plain(const std::string& text) const {
   std::vector<int> result;
   const std::vector<std::string> words = pretokenize(text);
   std::vector<int> ids, next;
@@ -137,6 +167,36 @@ std::vector<int> BPETokenizer::encode(const std::string& text) const {
     result.insert(result.end(), ids.begin(), ids.end());
   }
   return result;
+}
+
+// Special tokens are matched leftmost-first and emitted as one id each; the
+// text between them is encoded with the ordinary BPE merges.
+std::vector<int> BPETokenizer::encode(const std::string& text) const {
+  if (specials_.empty()) return encode_plain(text);
+  std::vector<int> out;
+  size_t pos = 0;
+  const size_t n = text.size();
+  while (pos < n) {
+    size_t best_at = std::string::npos;
+    int best_k = -1;
+    for (size_t k = 0; k < specials_.size(); ++k) {
+      const size_t at = text.find(specials_[k], pos);
+      if (at != std::string::npos && (best_at == std::string::npos || at < best_at)) {
+        best_at = at;
+        best_k = static_cast<int>(k);
+      }
+    }
+    if (best_k < 0) {
+      std::vector<int> tail = encode_plain(text.substr(pos));
+      out.insert(out.end(), tail.begin(), tail.end());
+      break;
+    }
+    std::vector<int> mid = encode_plain(text.substr(pos, best_at - pos));
+    out.insert(out.end(), mid.begin(), mid.end());
+    out.push_back(special_id(best_k));
+    pos = best_at + specials_[static_cast<size_t>(best_k)].size();
+  }
+  return out;
 }
 
 std::string BPETokenizer::decode(const std::vector<int>& ids) const {

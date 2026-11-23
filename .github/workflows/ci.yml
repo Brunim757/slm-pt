@@ -21,8 +21,9 @@ jobs:
         run: ./build/slmpt_gradcheck
       - name: BPE round-trip + end-to-end smoke
         run: |
-          printf '### Usuário:\nOlá, tudo bem?\n\n### Assistente:\nTudo ótimo! E você?\n\n' > /tmp/s.txt
-          printf '### Usuário:\nQuem é você?\n\n### Assistente:\nSou uma IA pequena.\n\n' >> /tmp/s.txt
+          printf '<|user|>\nOlá, tudo bem?\n<|assistant|>\nTudo ótimo! E você?\n<|end|>\n' > /tmp/s.txt
+          printf '<|user|>\nQuem é você?\n<|assistant|>\nSou uma IA pequena.\n<|end|>\n' >> /tmp/s.txt
+          printf '<|text|>\nO Brasil é um país da América do Sul. Sua capital é Brasília.\n<|end|>\n' >> /tmp/s.txt
           for i in $(seq 1 200); do cat /tmp/s.txt; done > /tmp/corpus.txt
           ./build/slmpt_bpe --in /tmp/corpus.txt --out /tmp/tok.txt --ids /tmp/corpus.ids --vocab 512
           mkdir -p /tmp/runs

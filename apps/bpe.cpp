@@ -52,9 +52,19 @@ int main(int argc, char** argv) {
     return 1;
   }
 
-  // 1) word frequencies
+  // 1) word frequencies.  Reserved control tokens are stripped first so that no
+  //    merge is ever learned inside them — they must stay atomic.
+  const std::vector<std::string>& specials = BPETokenizer::default_specials();
+  std::string freq_text = text;
+  for (const std::string& s : specials) {
+    size_t p = 0;
+    while ((p = freq_text.find(s, p)) != std::string::npos) {
+      freq_text.replace(p, s.size(), " ");
+      p += 1;
+    }
+  }
   std::unordered_map<std::string, int> freq;
-  for (const std::string& w : BPETokenizer::pretokenize(text)) freq[w]++;
+  for (const std::string& w : BPETokenizer::pretokenize(freq_text)) freq[w]++;
 
   std::vector<std::pair<std::string, int>> wf(freq.begin(), freq.end());
   const int max_words = std::atoi(argval(argc, argv, "--max-words", "60000"));
@@ -82,9 +92,11 @@ int main(int argc, char** argv) {
   std::fprintf(stderr, "corpus %.2f MB, %zu unique words (using %zu), target vocab %d\n",
                text.size() / 1048576.0, freq.size(), words.size(), target_vocab);
 
-  // 2) learn merges
+  // 2) learn merges (leaving room for the reserved special tokens)
   std::vector<std::pair<int, int>> merges;
-  const int max_merges = target_vocab - BPETokenizer::kBase;
+  int max_merges = target_vocab - BPETokenizer::kBase -
+                   static_cast<int>(specials.size());
+  if (max_merges < 0) max_merges = 0;
   const auto t0 = std::chrono::steady_clock::now();
   std::unordered_map<uint64_t, long long> counts;
   for (int m = 0; m < max_merges; ++m) {
@@ -137,6 +149,7 @@ int main(int argc, char** argv) {
 
   BPETokenizer tok;
   tok.set_merges(merges);
+  tok.set_specials(BPETokenizer::default_specials());
   if (!tok.save(out)) {
     std::fprintf(stderr, "cannot write %s\n", out.c_str());
     return 1;
