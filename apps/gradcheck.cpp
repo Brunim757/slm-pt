@@ -16,11 +16,12 @@ int main() {
   c.vocab = 256;
   // Dims chosen as multiples of the widest SIMD register (32 floats) so the
   // finite-difference check exercises the vectorized GEMM kernels, not just the
-  // scalar fallback.
-  c.n_embd = 32;
+  // scalar fallback.  hd = n_embd/n_head = 32 and block = 32 make the attention
+  // scores/context GEMMs (K,N in {hd,T}) land on the wide 32-output path too.
+  c.n_embd = 64;
   c.n_layer = 2;
-  c.n_head = 4;
-  c.block = 8;
+  c.n_head = 2;
+  c.block = 32;
   c.batch = 2;
   c.seed = 7;
 

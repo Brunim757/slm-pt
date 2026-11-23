@@ -122,10 +122,17 @@ inline void saxpy(float* y, const float* x, float a, int n) {
 // block of N outputs, so the inner loop is pure FMA (no horizontal reduction),
 // and each W row is loaded once and reused across MR batch rows.  This is used
 // for the forward pass (W = transposed weight) and for dx in the backward pass.
-void gemm_bcast(const float* x, const float* W, float* y, int rows, int K, int N) {
+template <bool PAR>
+void gemm_bcast_t(const float* x, const float* W, float* y, int rows, int K, int N) {
   if (rows <= 0 || K <= 0 || N <= 0) return;
+  auto run = [](int n, const std::function<void(int, int)>& f) {
+    if (PAR)
+      parallel_for(n, f);
+    else
+      f(0, n);
+  };
 #if defined(__AVX512F__)
-  constexpr int VW = 16, MR = 6, NV = 2, NR = VW * NV;  // 6 rows x 32 outputs
+  constexpr int VW = 16, MR = 8, NV = 2, NR = VW * NV;  // 8 rows x 32 outputs
 #elif defined(__AVX2__)
   constexpr int VW = 8, MR = 4, NV = 2, NR = VW * NV;  // 4 rows x 16 outputs
 #elif defined(__ARM_NEON)
@@ -134,7 +141,7 @@ void gemm_bcast(const float* x, const float* W, float* y, int rows, int K, int N
   constexpr int VW = 1, MR = 1, NV = 1, NR = 1;
 #endif
   if (N % NR != 0) {
-    parallel_for(rows, [&](int r0, int r1) {
+    run(rows, [&](int r0, int r1) {
       for (int r = r0; r < r1; ++r) {
         for (int o = 0; o < N; ++o) {
           float s = 0.f;
@@ -148,7 +155,7 @@ void gemm_bcast(const float* x, const float* W, float* y, int rows, int K, int N
   const int ncol = N / NR;
   const int nrow = (rows + MR - 1) / MR;
   const int ntiles = ncol * nrow;
-  parallel_for(ntiles, [&](int t0, int t1) {
+  run(ntiles, [&](int t0, int t1) {
     for (int t = t0; t < t1; ++t) {
       const int cb = t / nrow;
       const int rb = t - cb * nrow;
@@ -235,6 +242,13 @@ void gemm_bcast(const float* x, const float* W, float* y, int rows, int K, int N
 #endif
     }
   });
+}
+
+void gemm_bcast(const float* x, const float* W, float* y, int rows, int K, int N) {
+  gemm_bcast_t<true>(x, W, y, rows, K, N);
+}
+void gemm_bcast_serial(const float* x, const float* W, float* y, int rows, int K, int N) {
+  gemm_bcast_t<false>(x, W, y, rows, K, N);
 }
 
 // dW[out][in] += dy[rows][out]^T @ x[rows][in]
@@ -737,37 +751,68 @@ void Model::forward(const int* toks, int B, int T) {
 void Model::attn_forward(LayerActs& A, int B, int T) {
   const float scale = 1.f / std::sqrt(static_cast<float>(hd_));
   const int C = C_, H = H_, hd = hd_;
-  parallel_for(B * H, [&](int bh0, int bh1) {
+  const int nt = std::max(1, get_threads());
+  // Per-worker scratch (reused across this worker's heads, no allocation in the
+  // hot loop).  The old code did a horizontal-reduction dot per (i,j); here the
+  // scores and the context become small GEMMs, which the broadcast kernel runs
+  // at full SIMD width with no horizontal reductions.
+  const size_t th = static_cast<size_t>(T) * hd;
+  const size_t tt = static_cast<size_t>(T) * T;
+  const size_t sz = th * 4 + static_cast<size_t>(hd) * T + tt;
+  std::vector<float> scratch(static_cast<size_t>(nt) * sz, 0.f);
+  parallel_for_ctx(B * H, [&](int wid, int bh0, int bh1) {
+    float* base = scratch.data() + static_cast<size_t>(wid) * sz;
+    float* Qh = base;
+    float* Kh = Qh + th;
+    float* Vh = Kh + th;
+    float* Ctx = Vh + th;
+    float* Kt = Ctx + th;
+    float* S = Kt + static_cast<size_t>(hd) * T;
     for (int bh = bh0; bh < bh1; ++bh) {
       const int b = bh / H, h = bh % H;
-      float* pr = A.att.data() + static_cast<size_t>(bh) * T * T;
       for (int i = 0; i < T; ++i) {
-        const int ri = b * T + i;
-        const float* qi = A.q.data() + static_cast<size_t>(ri) * C + h * hd;
+        const int r = b * T + i;
+        const float* q = A.q.data() + static_cast<size_t>(r) * C + h * hd;
+        const float* k = A.k.data() + static_cast<size_t>(r) * C + h * hd;
+        const float* v = A.v.data() + static_cast<size_t>(r) * C + h * hd;
+        for (int d = 0; d < hd; ++d) {
+          Qh[static_cast<size_t>(i) * hd + d] = q[d];
+          Kh[static_cast<size_t>(i) * hd + d] = k[d];
+          Vh[static_cast<size_t>(i) * hd + d] = v[d];
+        }
+      }
+      for (int j = 0; j < T; ++j)
+        for (int d = 0; d < hd; ++d) Kt[static_cast<size_t>(d) * T + j] = Kh[static_cast<size_t>(j) * hd + d];
+      // S = Qh @ Kt^T  (full T x T; causal mask applied next)
+      gemm_bcast_serial(Qh, Kt, S, T, hd, T);
+      float* pr = A.att.data() + static_cast<size_t>(bh) * tt;
+      for (int i = 0; i < T; ++i) {
         float mx = -1e30f;
         for (int j = 0; j <= i; ++j) {
-          const int rj = b * T + j;
-          const float* kj = A.k.data() + static_cast<size_t>(rj) * C + h * hd;
-          float s = dot_f32(qi, kj, hd);
-          s *= scale;
-          pr[i * T + j] = s;
+          const float s = S[static_cast<size_t>(i) * T + j] * scale;
+          S[static_cast<size_t>(i) * T + j] = s;
           if (s > mx) mx = s;
         }
         float sum = 0.f;
         for (int j = 0; j <= i; ++j) {
-          const float e = std::exp(pr[i * T + j] - mx);
-          pr[i * T + j] = e;
+          const float e = std::exp(S[static_cast<size_t>(i) * T + j] - mx);
+          S[static_cast<size_t>(i) * T + j] = e;
           sum += e;
         }
         const float inv = 1.f / sum;
-        for (int j = 0; j <= i; ++j) pr[i * T + j] *= inv;
-        float* ci = A.ctx.data() + static_cast<size_t>(ri) * C + h * hd;
-        for (int d = 0; d < hd; ++d) ci[d] = 0.f;
         for (int j = 0; j <= i; ++j) {
-          const int rj = b * T + j;
-          const float* vj = A.v.data() + static_cast<size_t>(rj) * C + h * hd;
-          saxpy(ci, vj, pr[i * T + j], hd);
+          const float p = S[static_cast<size_t>(i) * T + j] * inv;
+          S[static_cast<size_t>(i) * T + j] = p;
+          pr[static_cast<size_t>(i) * T + j] = p;
         }
+        for (int j = i + 1; j < T; ++j) S[static_cast<size_t>(i) * T + j] = 0.f;
+      }
+      // Ctx = P @ Vh
+      gemm_bcast_serial(S, Vh, Ctx, T, T, hd);
+      for (int i = 0; i < T; ++i) {
+        const int r = b * T + i;
+        float* ci = A.ctx.data() + static_cast<size_t>(r) * C + h * hd;
+        for (int d = 0; d < hd; ++d) ci[d] = Ctx[static_cast<size_t>(i) * hd + d];
       }
     }
   });
@@ -781,35 +826,85 @@ void Model::attn_backward(LayerActs& A, int B, int T, const float* dctx,
   std::fill(dq.begin(), dq.end(), 0.f);
   std::fill(dk.begin(), dk.end(), 0.f);
   std::fill(dv.begin(), dv.end(), 0.f);
-  parallel_for(B * H, [&](int bh0, int bh1) {
-    std::vector<float> dp(T);
+  const int nt = std::max(1, get_threads());
+  const size_t th = static_cast<size_t>(T) * hd;
+  const size_t tt = static_cast<size_t>(T) * T;
+  const size_t sz = th * 7 + static_cast<size_t>(hd) * T * 2 + tt * 5 + T;
+  std::vector<float> scratch(static_cast<size_t>(nt) * sz, 0.f);
+  parallel_for_ctx(B * H, [&](int wid, int bh0, int bh1) {
+    float* base = scratch.data() + static_cast<size_t>(wid) * sz;
+    float* Qh = base;
+    float* Kh = Qh + th;
+    float* Vh = Kh + th;
+    float* dCh = Vh + th;
+    float* dQh = dCh + th;
+    float* dKh = dQh + th;
+    float* dVh = dKh + th;
+    float* Vt = dVh + th;
+    float* Kt = Vt + static_cast<size_t>(hd) * T;
+    float* P = Kt + static_cast<size_t>(hd) * T;
+    float* dP = P + tt;
+    float* dS = dP + tt;
+    float* dSt = dS + tt;
+    float* Pt = dSt + tt;
+    float* rowv = Pt + tt;
     for (int bh = bh0; bh < bh1; ++bh) {
       const int b = bh / H, h = bh % H;
-      const float* pr = A.att.data() + static_cast<size_t>(bh) * T * T;
       for (int i = 0; i < T; ++i) {
-        const int ri = b * T + i;
-        const float* dci = dctx + static_cast<size_t>(ri) * C + h * hd;
-        const float* qi = A.q.data() + static_cast<size_t>(ri) * C + h * hd;
-        for (int j = 0; j <= i; ++j) {
-          const int rj = b * T + j;
-          const float* vj = A.v.data() + static_cast<size_t>(rj) * C + h * hd;
-          dp[j] = dot_f32(dci, vj, hd);
+        const int r = b * T + i;
+        const float* q = A.q.data() + static_cast<size_t>(r) * C + h * hd;
+        const float* k = A.k.data() + static_cast<size_t>(r) * C + h * hd;
+        const float* v = A.v.data() + static_cast<size_t>(r) * C + h * hd;
+        const float* dc = dctx + static_cast<size_t>(r) * C + h * hd;
+        for (int d = 0; d < hd; ++d) {
+          Qh[static_cast<size_t>(i) * hd + d] = q[d];
+          Kh[static_cast<size_t>(i) * hd + d] = k[d];
+          Vh[static_cast<size_t>(i) * hd + d] = v[d];
+          dCh[static_cast<size_t>(i) * hd + d] = dc[d];
         }
-        for (int j = 0; j <= i; ++j) {
-          const int rj = b * T + j;
-          float* dvj = dv.data() + static_cast<size_t>(rj) * C + h * hd;
-          saxpy(dvj, dci, pr[i * T + j], hd);
+      }
+      const float* pr = A.att.data() + static_cast<size_t>(bh) * tt;
+      for (int i = 0; i < T; ++i) {
+        for (int j = 0; j < T; ++j) {
+          const float p = (j <= i) ? pr[static_cast<size_t>(i) * T + j] : 0.f;
+          P[static_cast<size_t>(i) * T + j] = p;
+          Pt[static_cast<size_t>(j) * T + i] = p;
         }
+      }
+      for (int j = 0; j < T; ++j)
+        for (int d = 0; d < hd; ++d) {
+          Vt[static_cast<size_t>(d) * T + j] = Vh[static_cast<size_t>(j) * hd + d];
+          Kt[static_cast<size_t>(d) * T + j] = Kh[static_cast<size_t>(j) * hd + d];
+        }
+      // dP = dCh @ Vh^T
+      gemm_bcast_serial(dCh, Vt, dP, T, hd, T);
+      // dVh = P^T @ dCh
+      gemm_bcast_serial(Pt, dCh, dVh, T, T, hd);
+      for (int i = 0; i < T; ++i) {
         float dot = 0.f;
-        for (int j = 0; j <= i; ++j) dot += pr[i * T + j] * dp[j];
-        float* dqi = dq.data() + static_cast<size_t>(ri) * C + h * hd;
+        for (int j = 0; j <= i; ++j) dot += P[static_cast<size_t>(i) * T + j] * dP[static_cast<size_t>(i) * T + j];
+        rowv[i] = dot;
+      }
+      for (int i = 0; i < T; ++i) {
         for (int j = 0; j <= i; ++j) {
-          const float dsc = pr[i * T + j] * (dp[j] - dot) * scale;
-          const int rj = b * T + j;
-          const float* kj = A.k.data() + static_cast<size_t>(rj) * C + h * hd;
-          float* dkj = dk.data() + static_cast<size_t>(rj) * C + h * hd;
-          saxpy(dqi, kj, dsc, hd);
-          saxpy(dkj, qi, dsc, hd);
+          const float d = P[static_cast<size_t>(i) * T + j] *
+                          (dP[static_cast<size_t>(i) * T + j] - rowv[i]) * scale;
+          dS[static_cast<size_t>(i) * T + j] = d;
+          dSt[static_cast<size_t>(j) * T + i] = d;
+        }
+      }
+      // dQh = dS @ Kh ; dKh = dS^T @ Qh
+      gemm_bcast_serial(dS, Kh, dQh, T, T, hd);
+      gemm_bcast_serial(dSt, Qh, dKh, T, T, hd);
+      for (int i = 0; i < T; ++i) {
+        const int r = b * T + i;
+        float* dqi = dq.data() + static_cast<size_t>(r) * C + h * hd;
+        float* dki = dk.data() + static_cast<size_t>(r) * C + h * hd;
+        float* dvi = dv.data() + static_cast<size_t>(r) * C + h * hd;
+        for (int d = 0; d < hd; ++d) {
+          dqi[d] = dQh[static_cast<size_t>(i) * hd + d];
+          dki[d] = dKh[static_cast<size_t>(i) * hd + d];
+          dvi[d] = dVh[static_cast<size_t>(i) * hd + d];
         }
       }
     }

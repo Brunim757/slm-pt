@@ -40,4 +40,26 @@ inline void parallel_for(int n, const std::function<void(int, int)>& fn) {
   for (auto& th : pool) th.join();
 }
 
+// Like parallel_for, but also hands each worker a stable index in [0, nt) so it
+// can use its own scratch slice (no locks, no per-item allocation).
+inline void parallel_for_ctx(int n, const std::function<void(int, int, int)>& fn) {
+  if (n <= 0) return;
+  int nt = thread_count();
+  if (nt <= 1 || n <= 1) {
+    fn(0, 0, n);
+    return;
+  }
+  if (nt > n) nt = n;
+  std::vector<std::thread> pool;
+  pool.reserve(nt);
+  const int chunk = (n + nt - 1) / nt;
+  for (int t = 0; t < nt; ++t) {
+    const int lo = t * chunk;
+    const int hi = std::min(n, lo + chunk);
+    if (lo >= hi) break;
+    pool.emplace_back([&fn, t, lo, hi]() { fn(t, lo, hi); });
+  }
+  for (auto& th : pool) th.join();
+}
+
 }  // namespace slmpt
