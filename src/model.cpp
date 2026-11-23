@@ -116,20 +116,126 @@ inline void saxpy(float* y, const float* x, float a, int n) {
 #endif
 }
 
-// y[rows,out] = x[rows,in] @ W[out,in]^T   (W row-major [out][in])
-void linear_fwd(const float* x, const float* W, float* y, int rows, int in, int out) {
-  parallel_for(rows, [&](int r0, int r1) {
-    for (int r = r0; r < r1; ++r) {
-      const float* xr = x + static_cast<size_t>(r) * in;
-      float* yr = y + static_cast<size_t>(r) * out;
-      int o = 0;
-      for (; o + 4 <= out; o += 4) {
-        dot4_f32(xr, W + static_cast<size_t>(o + 0) * in,
-                 W + static_cast<size_t>(o + 1) * in,
-                 W + static_cast<size_t>(o + 2) * in,
-                 W + static_cast<size_t>(o + 3) * in, in, yr + o);
+// y[rows,N] = x[rows,K] @ W[K,N]   (W row-major [K][N]).
+// SIMD broadcast microkernel: the scalar x[r][k] is broadcast into a contiguous
+// block of N outputs, so the inner loop is pure FMA (no horizontal reduction),
+// and each W row is loaded once and reused across MR batch rows.  This is used
+// for the forward pass (W = transposed weight) and for dx in the backward pass.
+void gemm_bcast(const float* x, const float* W, float* y, int rows, int K, int N) {
+  if (rows <= 0 || K <= 0 || N <= 0) return;
+#if defined(__AVX2__)
+  constexpr int VW = 8, MR = 4, NV = 2, NR = VW * NV;  // 4 rows x 16 outputs
+#elif defined(__ARM_NEON)
+  constexpr int VW = 4, MR = 4, NV = 2, NR = VW * NV;  // 4 rows x 8 outputs
+#else
+  constexpr int VW = 1, MR = 1, NV = 1, NR = 1;
+#endif
+  if (N % NR != 0) {
+    parallel_for(rows, [&](int r0, int r1) {
+      for (int r = r0; r < r1; ++r) {
+        for (int o = 0; o < N; ++o) {
+          float s = 0.f;
+          for (int k = 0; k < K; ++k) s += x[static_cast<size_t>(r) * K + k] * W[static_cast<size_t>(k) * N + o];
+          y[static_cast<size_t>(r) * N + o] = s;
+        }
       }
-      for (; o < out; ++o) yr[o] = dot_f32(xr, W + static_cast<size_t>(o) * in, in);
+    });
+    return;
+  }
+  const int ncol = N / NR;
+  const int nrow = (rows + MR - 1) / MR;
+  const int ntiles = ncol * nrow;
+  parallel_for(ntiles, [&](int t0, int t1) {
+    for (int t = t0; t < t1; ++t) {
+      const int cb = t / nrow;
+      const int rb = t - cb * nrow;
+      const int o0 = cb * NR;
+      const int r0 = rb * MR;
+#if defined(__AVX2__)
+      __m256 acc[MR][NV];
+      for (int m = 0; m < MR; ++m)
+        for (int v = 0; v < NV; ++v) acc[m][v] = _mm256_setzero_ps();
+      for (int k = 0; k < K; ++k) {
+        const float* wk = W + static_cast<size_t>(k) * N + o0;
+        __m256 wv[NV];
+        for (int v = 0; v < NV; ++v) wv[v] = _mm256_loadu_ps(wk + v * VW);
+        for (int m = 0; m < MR; ++m) {
+          const int r = r0 + m;
+          if (r >= rows) break;
+          const __m256 xv = _mm256_set1_ps(x[static_cast<size_t>(r) * K + k]);
+          for (int v = 0; v < NV; ++v)
+            acc[m][v] = _mm256_fmadd_ps(xv, wv[v], acc[m][v]);
+        }
+      }
+      for (int m = 0; m < MR; ++m) {
+        const int r = r0 + m;
+        if (r >= rows) break;
+        for (int v = 0; v < NV; ++v)
+          _mm256_storeu_ps(y + static_cast<size_t>(r) * N + o0 + v * VW, acc[m][v]);
+      }
+#elif defined(__ARM_NEON)
+      float32x4_t acc[MR][NV];
+      for (int m = 0; m < MR; ++m)
+        for (int v = 0; v < NV; ++v) acc[m][v] = vdupq_n_f32(0.f);
+      for (int k = 0; k < K; ++k) {
+        const float* wk = W + static_cast<size_t>(k) * N + o0;
+        float32x4_t wv[NV];
+        for (int v = 0; v < NV; ++v) wv[v] = vld1q_f32(wk + v * VW);
+        for (int m = 0; m < MR; ++m) {
+          const int r = r0 + m;
+          if (r >= rows) break;
+          const float32x4_t xv = vdupq_n_f32(x[static_cast<size_t>(r) * K + k]);
+          for (int v = 0; v < NV; ++v)
+            acc[m][v] = vmlaq_f32(acc[m][v], xv, wv[v]);
+        }
+      }
+      for (int m = 0; m < MR; ++m) {
+        const int r = r0 + m;
+        if (r >= rows) break;
+        for (int v = 0; v < NV; ++v)
+          vst1q_f32(y + static_cast<size_t>(r) * N + o0 + v * VW, acc[m][v]);
+      }
+#else
+      for (int m = 0; m < MR; ++m) {
+        const int r = r0 + m;
+        if (r >= rows) break;
+        for (int j = 0; j < NR; ++j) {
+          const int o = o0 + j;
+          float s = 0.f;
+          for (int k = 0; k < K; ++k)
+            s += x[static_cast<size_t>(r) * K + k] * W[static_cast<size_t>(k) * N + o];
+          y[static_cast<size_t>(r) * N + o] = s;
+        }
+      }
+#endif
+    }
+  });
+}
+
+// y[rows,out] = x[rows,in] @ W[out,in]^T   (W row-major [out][in])
+// Cache-blocked over outputs: a block of W rows stays hot while every batch
+// row streams past it, so each weight is fetched from DRAM once per call
+// instead of once per row (the previous loop order re-read all of W for every
+// row, which made this memory-bandwidth bound).
+void linear_fwd(const float* x, const float* W, float* y, int rows, int in, int out) {
+  constexpr int OB = 32;
+  const int nob = (out + OB - 1) / OB;
+  parallel_for(nob, [&](int b0, int b1) {
+    for (int b = b0; b < b1; ++b) {
+      const int o0 = b * OB;
+      const int o1 = std::min(o0 + OB, out);
+      for (int r = 0; r < rows; ++r) {
+        const float* xr = x + static_cast<size_t>(r) * in;
+        float* yr = y + static_cast<size_t>(r) * out;
+        int o = o0;
+        for (; o + 4 <= o1; o += 4) {
+          dot4_f32(xr, W + static_cast<size_t>(o + 0) * in,
+                   W + static_cast<size_t>(o + 1) * in,
+                   W + static_cast<size_t>(o + 2) * in,
+                   W + static_cast<size_t>(o + 3) * in, in, yr + o);
+        }
+        for (; o < o1; ++o) yr[o] = dot_f32(xr, W + static_cast<size_t>(o) * in, in);
+      }
     }
   });
 }
@@ -138,36 +244,25 @@ void linear_fwd(const float* x, const float* W, float* y, int rows, int in, int 
 void linear_bwd(const float* x, const float* W, const float* dy, float* dx, float* dW,
                 int rows, int in, int out) {
   if (dx) {
-    parallel_for(rows, [&](int r0, int r1) {
-      for (int r = r0; r < r1; ++r) {
-        const float* dyr = dy + static_cast<size_t>(r) * out;
-        float* dxr = dx + static_cast<size_t>(r) * in;
-        for (int i = 0; i < in; ++i) dxr[i] = 0.f;
-        for (int o = 0; o < out; ++o) {
-          const float g = dyr[o];
-          if (g == 0.f) continue;
-          const float* wo = W + static_cast<size_t>(o) * in;
-          saxpy(dxr, wo, g, in);
-        }
-      }
-    });
+    // dx[r][i] = sum_o dy[r][o] * W[o][i], i.e. dy[rows,out] @ W[out,in] with
+    // W already laid out [K][N] (K=out, N=in) — the fast SIMD kernel.
+    gemm_bcast(dy, W, dx, rows, out, in);
   }
   if (!dW) return;
-  // Block four output rows together: x[r] is loaded once and reused by all
-  // four saxpy updates, cutting x traffic by 4x.
-  const int ob = (out + 3) / 4;
-  parallel_for(ob, [&](int b0, int b1) {
+  // Output-block outer: the dW block stays in cache while rows stream past it,
+  // and each output row of dW is owned by exactly one task.
+  constexpr int OB = 32;
+  const int nob = (out + OB - 1) / OB;
+  parallel_for(nob, [&](int b0, int b1) {
     for (int b = b0; b < b1; ++b) {
-      const int o = b * 4;
-      const int cnt = (out - o < 4) ? (out - o) : 4;
-      float* dw[4] = {nullptr, nullptr, nullptr, nullptr};
-      for (int k = 0; k < cnt; ++k) dw[k] = dW + static_cast<size_t>(o + k) * in;
+      const int o0 = b * OB;
+      const int o1 = std::min(o0 + OB, out);
       for (int r = 0; r < rows; ++r) {
         const float* xr = x + static_cast<size_t>(r) * in;
         const float* dyr = dy + static_cast<size_t>(r) * out;
-        for (int k = 0; k < cnt; ++k) {
-          const float g = dyr[o + k];
-          if (g != 0.f) saxpy(dw[k], xr, g, in);
+        for (int o = o0; o < o1; ++o) {
+          const float g = dyr[o];
+          if (g != 0.f) saxpy(dW + static_cast<size_t>(o) * in, xr, g, in);
         }
       }
     }
@@ -296,6 +391,27 @@ void Model::init_params() {
   std::fill(lnfg_->data.begin(), lnfg_->data.end(), 1.f);
 }
 
+void Model::sync_transposed() {
+  auto tr = [](const Param* W, int out, int in, std::vector<float>& t) {
+    t.resize(static_cast<size_t>(in) * out);
+    for (int o = 0; o < out; ++o) {
+      const float* row = W->data.data() + static_cast<size_t>(o) * in;
+      for (int i = 0; i < in; ++i) t[static_cast<size_t>(i) * out + o] = row[i];
+    }
+  };
+  for (int l = 0; l < L_; ++l) {
+    LayerWeights& w = layers_[l];
+    tr(w.Wq, C_, C_, w.tq);
+    tr(w.Wk, C_, C_, w.tk);
+    tr(w.Wv, C_, C_, w.tv);
+    tr(w.Wo, C_, C_, w.to);
+    tr(w.W1, Hd_, C_, w.t1);
+    tr(w.W3, Hd_, C_, w.t3);
+    tr(w.W2, C_, Hd_, w.t2);
+  }
+  tr(wte_, V_, C_, twte_);
+}
+
 void Model::reallocate(int batch) {
   B_ = batch;
   R_ = B_ * T_;
@@ -408,6 +524,8 @@ void Model::forward(const int* toks, int B, int T) {
     std::exit(1);
   }
 
+  sync_transposed();
+
   parallel_for(R, [&](int r0, int r1) {
     for (int r = r0; r < r1; ++r) {
       const float* e = wte_->data.data() + static_cast<size_t>(toks[r]) * C;
@@ -423,29 +541,29 @@ void Model::forward(const int* toks, int B, int T) {
     std::copy(x_.begin(), x_.begin() + static_cast<size_t>(R) * C, A.xin.begin());
     rmsnorm_fwd(x_.data(), w.ln1g->data.data(), A.a.data(), A.ln1_rstd.data(), R, C,
                 cfg_.rms_eps);
-    linear_fwd(A.a.data(), w.Wq->data.data(), A.q.data(), R, C, C);
-    linear_fwd(A.a.data(), w.Wk->data.data(), A.k.data(), R, C, C);
-    linear_fwd(A.a.data(), w.Wv->data.data(), A.v.data(), R, C, C);
+    gemm_bcast(A.a.data(), w.tq.data(), A.q.data(), R, C, C);
+    gemm_bcast(A.a.data(), w.tk.data(), A.k.data(), R, C, C);
+    gemm_bcast(A.a.data(), w.tv.data(), A.v.data(), R, C, C);
     rope_apply(A.q.data(), R, Tc);
     rope_apply(A.k.data(), R, Tc);
     attn_forward(A, B, Tc);
-    linear_fwd(A.ctx.data(), w.Wo->data.data(), o_.data(), R, C, C);
+    gemm_bcast(A.ctx.data(), w.to.data(), o_.data(), R, C, C);
     for (size_t i = 0; i < static_cast<size_t>(R) * C; ++i) x_[i] += o_[i];
 
     std::copy(x_.begin(), x_.begin() + static_cast<size_t>(R) * C, A.x1.begin());
     rmsnorm_fwd(x_.data(), w.ln2g->data.data(), A.a2.data(), A.ln2_rstd.data(), R, C,
                 cfg_.rms_eps);
-    linear_fwd(A.a2.data(), w.W1->data.data(), A.h1.data(), R, C, Hd);
+    gemm_bcast(A.a2.data(), w.t1.data(), A.h1.data(), R, C, Hd);
     silu_fwd(A.h1.data(), A.h2.data(), R * Hd);
-    linear_fwd(A.a2.data(), w.W3->data.data(), A.h3.data(), R, C, Hd);
+    gemm_bcast(A.a2.data(), w.t3.data(), A.h3.data(), R, C, Hd);
     for (size_t i = 0; i < static_cast<size_t>(R) * Hd; ++i) A.h4[i] = A.h2[i] * A.h3[i];
-    linear_fwd(A.h4.data(), w.W2->data.data(), o_.data(), R, Hd, C);
+    gemm_bcast(A.h4.data(), w.t2.data(), o_.data(), R, Hd, C);
     for (size_t i = 0; i < static_cast<size_t>(R) * C; ++i) x_[i] += o_[i];
   }
 
   rmsnorm_fwd(x_.data(), lnfg_->data.data(), xf_.data(), rstdf_.data(), R, C,
               cfg_.rms_eps);
-  linear_fwd(xf_.data(), wte_->data.data(), logits_.data(), R, C, V_);
+  gemm_bcast(xf_.data(), twte_.data(), logits_.data(), R, C, V_);
 }
 
 void Model::attn_forward(LayerActs& A, int B, int T) {

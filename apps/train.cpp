@@ -103,6 +103,13 @@ int main(int argc, char** argv) {
               cfg.vocab);
   std::printf("params: %.2f M   threads: %d   rope_theta=%.0f\n", params / 1e6,
               get_threads(), cfg.rope_theta);
+#if defined(__AVX2__)
+  std::printf("simd: AVX2+FMA (8-wide)   gemm: tiled broadcast\n");
+#elif defined(__ARM_NEON)
+  std::printf("simd: NEON (4-wide)   gemm: tiled broadcast\n");
+#else
+  std::printf("simd: scalar   gemm: tiled broadcast\n");
+#endif
 
   if (!cfg.resume.empty()) {
     // Safety lock: a resume is only valid if the tokenizer used to build the

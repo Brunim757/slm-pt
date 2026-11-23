@@ -15,6 +15,9 @@ struct LayerWeights {
   Param *ln2g = nullptr;                              // RMSNorm gain (mlp)
   Param *W1 = nullptr, *W3 = nullptr;                 // gate/up  H x C  (SwiGLU)
   Param *W2 = nullptr;                                // down     C x H
+  // Transposed copies ([in][out]) refreshed before each forward so the SIMD
+  // microkernel can read contiguous output rows.
+  std::vector<float> tq, tk, tv, to, t1, t3, t2;
 };
 
 // Activations cached for the backward pass of one layer.
@@ -75,6 +78,7 @@ class Model {
  private:
   void init_params();
   void build_rope();
+  void sync_transposed();
   double cross_entropy(const int* tgts);
   void backward(const int* toks);
   void attn_forward(LayerActs& A, int B, int T);
@@ -97,6 +101,7 @@ class Model {
   Param *wte_ = nullptr, *lnfg_ = nullptr;
   std::vector<LayerWeights> layers_;
   std::vector<LayerActs> acts_;
+  std::vector<float> twte_;  // transposed embedding [C][V]
 
   std::vector<float> x_, o_, xf_, logits_, dlogits_, rstdf_;
 
