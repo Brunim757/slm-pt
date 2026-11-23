@@ -41,6 +41,16 @@ WIKI = "wikimedia/wikipedia"
 WIKI_CONFIG = "20231101.pt"  # Portuguese dump; shards live under this subdir
 PT_LANGS = {"pt", "pt-BR", "pt_PT", "pt-br"}
 
+# Identity: a fixed system message prepended to every chat block.  It teaches the
+# model *who it is* the same way real assistants do, and the chat app reuses the
+# first variant verbatim at inference.  A couple of paraphrases so the model does
+# not overfit to one exact string.
+SYSTEM_PROMPTS = [
+    "Você é o KizuSmall, uma IA pequena de terminal que fala português.",
+    "Você é o KizuSmall, um modelo de linguagem pequeno que conversa em português.",
+    "Você é o KizuSmall, uma IA que ajuda e conversa em português.",
+]
+
 
 def open_url(url, timeout=300):
     req = urllib.request.Request(url, headers={"User-Agent": "slm-pt"})
@@ -91,9 +101,10 @@ def download(url, path):
 
 
 def fmt(instr, inp, out):
-    # ChatML-style: role markers are reserved special tokens (atomic in the BPE),
-    # and every turn closes with <|end|>.
-    parts = ["<|user|>\n", instr, "\n"]
+    # ChatML-style: reserved role tokens (atomic in the BPE), a system/identity
+    # line first, and every turn closed with <|end|>.
+    parts = ["<|system|>\n", random.choice(SYSTEM_PROMPTS), "\n",
+             "<|user|>\n", instr, "\n"]
     if inp:
         parts.append(inp + "\n")
     parts += ["<|assistant|>\n", out, "\n<|end|>\n"]
@@ -477,21 +488,22 @@ def main():
         text = f.read()
     n_user = text.count("<|user|>")
     n_asst = text.count("<|assistant|>")
+    n_sys = text.count("<|system|>")
     n_end = text.count("<|end|>")
     n_txt = text.count("<|text|>")
     # empty user turn = <|user|> immediately followed by <|assistant|>; empty
     # answer = <|assistant|> immediately followed by <|end|>.
     n_empty = text.count("<|user|>\n<|assistant|>") + text.count("<|assistant|>\n<|end|>")
-    if n_user != n_asst or n_empty:
+    if n_user != n_asst or n_sys != n_user or n_empty:
         sys.exit(f"corpus check FAILED: user={n_user} assistant={n_asst} "
-                 f"empty_turns={n_empty}")
+                 f"system={n_sys} empty_turns={n_empty}")
     if n_end != n_user + n_txt:
         sys.exit(f"corpus check FAILED: end-token count {n_end} != "
                  f"user {n_user} + text {n_txt}")
     if args.wiki and not args.no_net and n_txt == 0:
         sys.exit("corpus check FAILED: no raw prose (wiki) was included")
-    print(f"corpus check OK: {n_user} chat pairs, {n_txt} raw docs, "
-          f"{n_end} <|end|>, no empty turns", file=sys.stderr)
+    print(f"corpus check OK: {n_user} chat pairs ({n_sys} with system), "
+          f"{n_txt} raw docs, {n_end} <|end|>, no empty turns", file=sys.stderr)
 
 
 if __name__ == "__main__":

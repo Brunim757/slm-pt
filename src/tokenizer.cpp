@@ -16,7 +16,7 @@ inline uint64_t pair_key(int a, int b) {
 
 const std::vector<std::string>& BPETokenizer::default_specials() {
   static const std::vector<std::string> kSpecials = {
-      "<|user|>", "<|assistant|>", "<|end|>", "<|text|>"};
+      "<|system|>", "<|user|>", "<|assistant|>", "<|end|>", "<|text|>"};
   return kSpecials;
 }
 

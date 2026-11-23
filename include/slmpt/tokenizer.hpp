@@ -12,11 +12,11 @@ namespace slmpt {
 // accents included) survives encode/decode untouched. Merges are learned from
 // the corpus by `slmpt_bpe`; token id = 256 + merge_rank.
 //
-// On top of the merges sit a few *reserved special tokens* (`<|user|>`,
-// `<|assistant|>`, `<|end|>`, `<|text|>`).  They are assigned ids right after
-// the merges, are stored in the tokenizer file, and `encode()` matches them
-// atomically so a role marker is always exactly one token (never split into
-// bytes/merges) — the way real chat models delimit turns.
+// On top of the merges sit a few *reserved special tokens* (`<|system|>`,
+// `<|user|>`, `<|assistant|>`, `<|end|>`, `<|text|>`).  They are assigned ids
+// right after the merges, are stored in the tokenizer file, and `encode()`
+// matches them atomically so a role marker is always exactly one token (never
+// split into bytes/merges) — the way real chat models delimit turns.
 class BPETokenizer {
  public:
   static constexpr int kBase = 256;

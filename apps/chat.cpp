@@ -15,6 +15,11 @@
 
 using namespace slmpt;
 
+// Identity, matching the system line used when building the corpus (first
+// variant), prepended to every prompt so the model always knows who it is.
+static const char* kSystem =
+    "<|system|>\nVocê é o KizuSmall, uma IA pequena de terminal que fala português.\n";
+
 static const char* argval(int argc, char** argv, const char* key, const char* def) {
   const size_t kl = std::strlen(key);
   for (int i = 1; i < argc; ++i) {
@@ -100,7 +105,7 @@ int main(int argc, char** argv) {
       for (int i : idx) context += rag.texts[i] + "\n";
     }
 
-    const std::string prompt = "<|user|>\n" + context + line +
+    const std::string prompt = kSystem + std::string("<|user|>\n") + context + line +
                                "\n<|assistant|>\n";
     std::string resp = generate(model, tok, prompt, sp, rng);
     std::printf("ia> %s\n\n", resp.c_str());

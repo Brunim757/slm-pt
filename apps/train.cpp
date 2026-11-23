@@ -146,7 +146,9 @@ int main(int argc, char** argv) {
   sp.repetition_penalty = 1.15f;
   sp.max_new = 160;
   sp.stop = "<|end|>";
-  const std::string probe = "<|user|>\nOlá! Quem é você?\n<|assistant|>\n";
+  const std::string probe =
+      "<|system|>\nVocê é o KizuSmall, uma IA pequena de terminal que fala português.\n"
+      "<|user|>\nOlá! Quem é você?\n<|assistant|>\n";
 
   const double t0 = now_s();
   const double budget = cfg.max_minutes > 0 ? cfg.max_minutes * 60.0 : 1e18;
