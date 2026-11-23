@@ -149,6 +149,7 @@ int main(int argc, char** argv) {
   const double t0 = now_s();
   const double budget = cfg.max_minutes > 0 ? cfg.max_minutes * 60.0 : 1e18;
   double last_log = t0;
+  int last_step = 0;
   long tokens_seen = 0;
 
   for (int step = 1; step <= cfg.max_steps; ++step) {
@@ -170,11 +171,13 @@ int main(int argc, char** argv) {
     const double t = now_s();
     if (step % 10 == 0 || step == 1) {
       const double dt = t - last_log;
-      const double tps = dt > 0 ? (10.0 * cfg.batch * cfg.block) / dt : 0;
+      const int dsteps = step - last_step;
+      const double tps = dt > 0 ? (dsteps * (double)cfg.batch * cfg.block) / dt : 0;
       std::printf("step %6d | loss %.4f | lr %.2e | gnorm %.2f | %.0f tok/s | %.1f min\n",
                   step, loss, lr, opt.last_grad_norm(), tps, (t - t0) / 60.0);
       std::fflush(stdout);
       last_log = t;
+      last_step = step;
     }
 
     if (cfg.sample_every > 0 && step % cfg.sample_every == 0) {

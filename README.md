@@ -114,7 +114,7 @@ compressão) como **artifact**.
 
 ```bash
 # dispara um treino manual
-gh workflow run train.yml -f steps=40000 -f max_minutes=300 -f canarim_limit=30000
+gh workflow run train.yml -f steps=3000 -f max_minutes=300 -f canarim_limit=30000
 
 # acompanha e baixa o resultado
 gh run watch

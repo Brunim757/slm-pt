@@ -8,8 +8,8 @@ on:
   workflow_dispatch:
     inputs:
       steps:
-        description: "max training steps"
-        default: "30000"
+        description: "max training steps (5h fits ~3000 for KizuSmall)"
+        default: "3000"
       max_minutes:
         description: "wall-clock budget (minutes)"
         default: "300"
@@ -149,7 +149,7 @@ jobs:
             --block ${{ github.event.inputs.block || '256' }} \
             --batch ${{ github.event.inputs.batch || '32' }} \
             --lr ${{ github.event.inputs.lr || '4e-4' }} \
-            --steps ${{ github.event.inputs.steps || '30000' }} \
+            --steps ${{ github.event.inputs.steps || '3000' }} \
             --max-minutes ${{ github.event.inputs.max_minutes || '300' }} \
             --save-every 500 --sample-every 500 --threads "$(nproc)" $RESUME
 
