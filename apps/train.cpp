@@ -188,8 +188,9 @@ int main(int argc, char** argv) {
       const double dt = t - last_log;
       const int dsteps = step - last_step;
       const double tps = dt > 0 ? (dsteps * (double)cfg.batch * cfg.block) / dt : 0;
-      std::printf("step %6d | loss %.4f | lr %.2e | gnorm %.2f | %.0f tok/s | %.1f min\n",
-                  step, loss, lr, opt.last_grad_norm(), tps, (t - t0) / 60.0);
+      const double gflops = tps * model.flops_per_token() / 1e9;
+      std::printf("step %6d | loss %.4f | lr %.2e | gnorm %.2f | %.0f tok/s | %.0f GFLOP/s | %.1f min\n",
+                  step, loss, lr, opt.last_grad_norm(), tps, gflops, (t - t0) / 60.0);
       std::fflush(stdout);
       last_log = t;
       last_step = step;

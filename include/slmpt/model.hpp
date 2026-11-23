@@ -68,6 +68,9 @@ class Model {
   const float* last_logits() const {
     return logits_.data() + static_cast<size_t>(curR_ - 1) * V_;
   }
+  // Analytic FLOPs (forward + backward) per token: lets the trainer report the
+  // achieved GFLOP/s so we can see how close to the hardware ceiling we are.
+  double flops_per_token() const;
   // Mean of the final hidden state over the current sequence (RAG embedding).
   void mean_hidden(std::vector<float>& out) const;
 
@@ -109,6 +112,16 @@ class Model {
   std::vector<float> twte_;  // transposed embedding [C][V]
 
   std::vector<float> x_, o_, xf_, logits_, dlogits_, rstdf_;
+
+  // Backward-pass temporaries, allocated once and reused every step.  They are
+  // all fully overwritten before being read (every producing kernel writes each
+  // element), so they need no re-zeroing; this removes ~200 MB of allocation and
+  // zero-fill per step.
+  std::vector<float> b_dcur_, b_tmp_, b_dx_, b_dh1_, b_dh2_, b_dh3_, b_dh4_,
+      b_da2_, b_da2b_, b_dctx_, b_da_, b_dq_, b_dk_, b_dv_, b_da_q_, b_da_k_,
+      b_da_v_, b_dxin_;
+  // Per-worker scratch for the attention GEMMs (grown once, then reused).
+  std::vector<float> attn_fs_, attn_bs_;
 
   // KV cache (single sequence) for incremental inference.
   int cache_pos_ = 0;

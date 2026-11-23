@@ -154,94 +154,108 @@ void gemm_bcast_t(const float* x, const float* W, float* y, int rows, int K, int
   }
   const int ncol = N / NR;
   const int nrow = (rows + MR - 1) / MR;
-  const int ntiles = ncol * nrow;
-  run(ntiles, [&](int t0, int t1) {
-    for (int t = t0; t < t1; ++t) {
-      const int cb = t / nrow;
-      const int rb = t - cb * nrow;
-      const int o0 = cb * NR;
-      const int r0 = rb * MR;
+  // Group the output columns so each group's weight panel (K x NC) fits in L2,
+  // then stream every batch row past the group.  The panel is fetched from DRAM
+  // once per group and reused from L2 across all rows, and each activation row is
+  // touched once per group instead of once per NR-block (the previous flat tile
+  // order re-read x for every output block, which made wide matmuls such as the
+  // logits projection bandwidth-bound).
+  int ncb = ncol;
+  const int bytes_per_block = K * NR * static_cast<int>(sizeof(float));
+  if (bytes_per_block > 0) {
+    const int fit = (768 * 1024) / bytes_per_block;
+    if (fit >= 1 && fit < ncb) ncb = fit;
+  }
+  for (int g0 = 0; g0 < ncol; g0 += ncb) {
+    const int g1 = std::min(ncol, g0 + ncb);
+    run(nrow, [&](int p0, int p1) {
+      for (int rp = p0; rp < p1; ++rp) {
+        const int r0 = rp * MR;
+        for (int cb = g0; cb < g1; ++cb) {
+          const int o0 = cb * NR;
 #if defined(__AVX512F__)
-      __m512 acc[MR][NV];
-      for (int m = 0; m < MR; ++m)
-        for (int v = 0; v < NV; ++v) acc[m][v] = _mm512_setzero_ps();
-      for (int k = 0; k < K; ++k) {
-        const float* wk = W + static_cast<size_t>(k) * N + o0;
-        __m512 wv[NV];
-        for (int v = 0; v < NV; ++v) wv[v] = _mm512_loadu_ps(wk + v * VW);
-        for (int m = 0; m < MR; ++m) {
-          const int r = r0 + m;
-          if (r >= rows) break;
-          const __m512 xv = _mm512_set1_ps(x[static_cast<size_t>(r) * K + k]);
-          for (int v = 0; v < NV; ++v)
-            acc[m][v] = _mm512_fmadd_ps(xv, wv[v], acc[m][v]);
-        }
-      }
-      for (int m = 0; m < MR; ++m) {
-        const int r = r0 + m;
-        if (r >= rows) break;
-        for (int v = 0; v < NV; ++v)
-          _mm512_storeu_ps(y + static_cast<size_t>(r) * N + o0 + v * VW, acc[m][v]);
-      }
+          __m512 acc[MR][NV];
+          for (int m = 0; m < MR; ++m)
+            for (int v = 0; v < NV; ++v) acc[m][v] = _mm512_setzero_ps();
+          for (int k = 0; k < K; ++k) {
+            const float* wk = W + static_cast<size_t>(k) * N + o0;
+            __m512 wv[NV];
+            for (int v = 0; v < NV; ++v) wv[v] = _mm512_loadu_ps(wk + v * VW);
+            for (int m = 0; m < MR; ++m) {
+              const int r = r0 + m;
+              if (r >= rows) break;
+              const __m512 xv = _mm512_set1_ps(x[static_cast<size_t>(r) * K + k]);
+              for (int v = 0; v < NV; ++v)
+                acc[m][v] = _mm512_fmadd_ps(xv, wv[v], acc[m][v]);
+            }
+          }
+          for (int m = 0; m < MR; ++m) {
+            const int r = r0 + m;
+            if (r >= rows) break;
+            for (int v = 0; v < NV; ++v)
+              _mm512_storeu_ps(y + static_cast<size_t>(r) * N + o0 + v * VW, acc[m][v]);
+          }
 #elif defined(__AVX2__)
-      __m256 acc[MR][NV];
-      for (int m = 0; m < MR; ++m)
-        for (int v = 0; v < NV; ++v) acc[m][v] = _mm256_setzero_ps();
-      for (int k = 0; k < K; ++k) {
-        const float* wk = W + static_cast<size_t>(k) * N + o0;
-        __m256 wv[NV];
-        for (int v = 0; v < NV; ++v) wv[v] = _mm256_loadu_ps(wk + v * VW);
-        for (int m = 0; m < MR; ++m) {
-          const int r = r0 + m;
-          if (r >= rows) break;
-          const __m256 xv = _mm256_set1_ps(x[static_cast<size_t>(r) * K + k]);
-          for (int v = 0; v < NV; ++v)
-            acc[m][v] = _mm256_fmadd_ps(xv, wv[v], acc[m][v]);
-        }
-      }
-      for (int m = 0; m < MR; ++m) {
-        const int r = r0 + m;
-        if (r >= rows) break;
-        for (int v = 0; v < NV; ++v)
-          _mm256_storeu_ps(y + static_cast<size_t>(r) * N + o0 + v * VW, acc[m][v]);
-      }
+          __m256 acc[MR][NV];
+          for (int m = 0; m < MR; ++m)
+            for (int v = 0; v < NV; ++v) acc[m][v] = _mm256_setzero_ps();
+          for (int k = 0; k < K; ++k) {
+            const float* wk = W + static_cast<size_t>(k) * N + o0;
+            __m256 wv[NV];
+            for (int v = 0; v < NV; ++v) wv[v] = _mm256_loadu_ps(wk + v * VW);
+            for (int m = 0; m < MR; ++m) {
+              const int r = r0 + m;
+              if (r >= rows) break;
+              const __m256 xv = _mm256_set1_ps(x[static_cast<size_t>(r) * K + k]);
+              for (int v = 0; v < NV; ++v)
+                acc[m][v] = _mm256_fmadd_ps(xv, wv[v], acc[m][v]);
+            }
+          }
+          for (int m = 0; m < MR; ++m) {
+            const int r = r0 + m;
+            if (r >= rows) break;
+            for (int v = 0; v < NV; ++v)
+              _mm256_storeu_ps(y + static_cast<size_t>(r) * N + o0 + v * VW, acc[m][v]);
+          }
 #elif defined(__ARM_NEON)
-      float32x4_t acc[MR][NV];
-      for (int m = 0; m < MR; ++m)
-        for (int v = 0; v < NV; ++v) acc[m][v] = vdupq_n_f32(0.f);
-      for (int k = 0; k < K; ++k) {
-        const float* wk = W + static_cast<size_t>(k) * N + o0;
-        float32x4_t wv[NV];
-        for (int v = 0; v < NV; ++v) wv[v] = vld1q_f32(wk + v * VW);
-        for (int m = 0; m < MR; ++m) {
-          const int r = r0 + m;
-          if (r >= rows) break;
-          const float32x4_t xv = vdupq_n_f32(x[static_cast<size_t>(r) * K + k]);
-          for (int v = 0; v < NV; ++v)
-            acc[m][v] = vmlaq_f32(acc[m][v], xv, wv[v]);
-        }
-      }
-      for (int m = 0; m < MR; ++m) {
-        const int r = r0 + m;
-        if (r >= rows) break;
-        for (int v = 0; v < NV; ++v)
-          vst1q_f32(y + static_cast<size_t>(r) * N + o0 + v * VW, acc[m][v]);
-      }
+          float32x4_t acc[MR][NV];
+          for (int m = 0; m < MR; ++m)
+            for (int v = 0; v < NV; ++v) acc[m][v] = vdupq_n_f32(0.f);
+          for (int k = 0; k < K; ++k) {
+            const float* wk = W + static_cast<size_t>(k) * N + o0;
+            float32x4_t wv[NV];
+            for (int v = 0; v < NV; ++v) wv[v] = vld1q_f32(wk + v * VW);
+            for (int m = 0; m < MR; ++m) {
+              const int r = r0 + m;
+              if (r >= rows) break;
+              const float32x4_t xv = vdupq_n_f32(x[static_cast<size_t>(r) * K + k]);
+              for (int v = 0; v < NV; ++v)
+                acc[m][v] = vmlaq_f32(acc[m][v], xv, wv[v]);
+            }
+          }
+          for (int m = 0; m < MR; ++m) {
+            const int r = r0 + m;
+            if (r >= rows) break;
+            for (int v = 0; v < NV; ++v)
+              vst1q_f32(y + static_cast<size_t>(r) * N + o0 + v * VW, acc[m][v]);
+          }
 #else
-      for (int m = 0; m < MR; ++m) {
-        const int r = r0 + m;
-        if (r >= rows) break;
-        for (int j = 0; j < NR; ++j) {
-          const int o = o0 + j;
-          float s = 0.f;
-          for (int k = 0; k < K; ++k)
-            s += x[static_cast<size_t>(r) * K + k] * W[static_cast<size_t>(k) * N + o];
-          y[static_cast<size_t>(r) * N + o] = s;
+          for (int m = 0; m < MR; ++m) {
+            const int r = r0 + m;
+            if (r >= rows) break;
+            for (int j = 0; j < NR; ++j) {
+              const int o = o0 + j;
+              float s = 0.f;
+              for (int k = 0; k < K; ++k)
+                s += x[static_cast<size_t>(r) * K + k] * W[static_cast<size_t>(k) * N + o];
+              y[static_cast<size_t>(r) * N + o] = s;
+            }
+          }
+#endif
         }
       }
-#endif
-    }
-  });
+    });
+  }
 }
 
 void gemm_bcast(const float* x, const float* W, float* y, int rows, int K, int N) {
@@ -607,6 +621,25 @@ void Model::reallocate(int batch) {
   logits_.assign(rv, 0.f);
   dlogits_.assign(rv, 0.f);
   rstdf_.assign(R_, 0.f);
+  // Reused backward temporaries (see header): allocated once, no per-step churn.
+  b_dcur_.assign(rc, 0.f);
+  b_tmp_.assign(rc, 0.f);
+  b_dx_.assign(rc, 0.f);
+  b_da2_.assign(rc, 0.f);
+  b_da2b_.assign(rc, 0.f);
+  b_dctx_.assign(rc, 0.f);
+  b_da_.assign(rc, 0.f);
+  b_dq_.assign(rc, 0.f);
+  b_dk_.assign(rc, 0.f);
+  b_dv_.assign(rc, 0.f);
+  b_da_q_.assign(rc, 0.f);
+  b_da_k_.assign(rc, 0.f);
+  b_da_v_.assign(rc, 0.f);
+  b_dxin_.assign(rc, 0.f);
+  b_dh1_.assign(rh, 0.f);
+  b_dh2_.assign(rh, 0.f);
+  b_dh3_.assign(rh, 0.f);
+  b_dh4_.assign(rh, 0.f);
   for (int l = 0; l < L_; ++l) {
     LayerActs& A = acts_[l];
     A.xin.assign(rc, 0.f);
@@ -759,9 +792,11 @@ void Model::attn_forward(LayerActs& A, int B, int T) {
   const size_t th = static_cast<size_t>(T) * hd;
   const size_t tt = static_cast<size_t>(T) * T;
   const size_t sz = th * 4 + static_cast<size_t>(hd) * T + tt;
-  std::vector<float> scratch(static_cast<size_t>(nt) * sz, 0.f);
+  const size_t need = static_cast<size_t>(nt) * sz;
+  if (attn_fs_.size() < need) attn_fs_.resize(need);
+  float* scratch = attn_fs_.data();
   parallel_for_ctx(B * H, [&](int wid, int bh0, int bh1) {
-    float* base = scratch.data() + static_cast<size_t>(wid) * sz;
+    float* base = scratch + static_cast<size_t>(wid) * sz;
     float* Qh = base;
     float* Kh = Qh + th;
     float* Vh = Kh + th;
@@ -830,9 +865,11 @@ void Model::attn_backward(LayerActs& A, int B, int T, const float* dctx,
   const size_t th = static_cast<size_t>(T) * hd;
   const size_t tt = static_cast<size_t>(T) * T;
   const size_t sz = th * 7 + static_cast<size_t>(hd) * T * 2 + tt * 5 + T;
-  std::vector<float> scratch(static_cast<size_t>(nt) * sz, 0.f);
+  const size_t need = static_cast<size_t>(nt) * sz;
+  if (attn_bs_.size() < need) attn_bs_.resize(need);
+  float* scratch = attn_bs_.data();
   parallel_for_ctx(B * H, [&](int wid, int bh0, int bh1) {
-    float* base = scratch.data() + static_cast<size_t>(wid) * sz;
+    float* base = scratch + static_cast<size_t>(wid) * sz;
     float* Qh = base;
     float* Kh = Qh + th;
     float* Vh = Kh + th;
@@ -945,58 +982,65 @@ void Model::backward(const int* toks) {
   const size_t rc = static_cast<size_t>(R) * C;
   const size_t rh = static_cast<size_t>(R) * Hd;
 
-  std::vector<float> dcur(rc, 0.f), tmp(rc, 0.f);
-  linear_bwd(xf_.data(), wte_->data.data(), dlogits_.data(), dcur.data(),
-             wte_->grad.data(), R, C, V);
-  std::vector<float> dx(rc, 0.f);
-  rmsnorm_bwd(x_.data(), lnfg_->data.data(), dcur.data(), dx.data(), lnfg_->grad.data(),
-              rstdf_.data(), R, C);
+  // Reused member buffers: every kernel below overwrites its output fully, so
+  // no re-zeroing is needed between steps (see header comment).
+  float* dcur = b_dcur_.data();
+  float* tmp = b_tmp_.data();
+  float* dx = b_dx_.data();
+  float* dh4 = b_dh4_.data();
+  float* dh2 = b_dh2_.data();
+  float* dh3 = b_dh3_.data();
+  float* dh1 = b_dh1_.data();
+  float* da2 = b_da2_.data();
+  float* da2b = b_da2b_.data();
+  float* dctx = b_dctx_.data();
+  float* da = b_da_.data();
+  float* dq = b_dq_.data();
+  float* dk = b_dk_.data();
+  float* dv = b_dv_.data();
+  float* da_q = b_da_q_.data();
+  float* da_k = b_da_k_.data();
+  float* da_v = b_da_v_.data();
+  float* dxin = b_dxin_.data();
 
-  std::vector<float> dh4(rh), dh2(rh), dh3(rh), dh1(rh), da2(rc), dctx(rc), da(rc);
-  std::vector<float> dq(rc), dk(rc), dv(rc);
-  std::vector<float> da_q(rc), da_k(rc), da_v(rc), dxin(rc);
+  linear_bwd(xf_.data(), wte_->data.data(), dlogits_.data(), dcur, wte_->grad.data(),
+             R, C, V);
+  rmsnorm_bwd(x_.data(), lnfg_->data.data(), dcur, dx, lnfg_->grad.data(),
+              rstdf_.data(), R, C);
 
   for (int l = L_ - 1; l >= 0; --l) {
     LayerWeights& w = layers_[l];
     LayerActs& A = acts_[l];
 
     // x_after = x1 + o(mlp)  =>  grad wrt mlp output = dx
-    linear_bwd(A.h4.data(), w.W2->data.data(), dx.data(), dh4.data(), w.W2->grad.data(),
-               R, Hd, C);
+    linear_bwd(A.h4.data(), w.W2->data.data(), dx, dh4, w.W2->grad.data(), R, Hd, C);
     // h4 = h2 * h3
     for (size_t i = 0; i < rh; ++i) {
       dh2[i] = dh4[i] * A.h3[i];
       dh3[i] = dh4[i] * A.h2[i];
     }
     // h2 = silu(h1)
-    silu_bwd(A.h1.data(), dh2.data(), dh1.data(), R * Hd);
-    linear_bwd(A.a2.data(), w.W1->data.data(), dh1.data(), da2.data(), w.W1->grad.data(),
-               R, C, Hd);
+    silu_bwd(A.h1.data(), dh2, dh1, R * Hd);
+    linear_bwd(A.a2.data(), w.W1->data.data(), dh1, da2, w.W1->grad.data(), R, C, Hd);
     // W3 contributes to the same a2 grad
-    std::vector<float> da2b(rc, 0.f);
-    linear_bwd(A.a2.data(), w.W3->data.data(), dh3.data(), da2b.data(),
-               w.W3->grad.data(), R, C, Hd);
+    linear_bwd(A.a2.data(), w.W3->data.data(), dh3, da2b, w.W3->grad.data(), R, C, Hd);
     for (size_t i = 0; i < rc; ++i) da2[i] += da2b[i];
-    rmsnorm_bwd(A.x1.data(), w.ln2g->data.data(), da2.data(), tmp.data(),
-                w.ln2g->grad.data(), A.ln2_rstd.data(), R, C);
+    rmsnorm_bwd(A.x1.data(), w.ln2g->data.data(), da2, tmp, w.ln2g->grad.data(),
+                A.ln2_rstd.data(), R, C);
     for (size_t i = 0; i < rc; ++i) dx[i] += tmp[i];  // now grad wrt x1
 
     // x1 = x0 + o(attn)
-    linear_bwd(A.ctx.data(), w.Wo->data.data(), dx.data(), dctx.data(),
-               w.Wo->grad.data(), R, C, C);
-    attn_backward(A, B, T, dctx.data(), dq, dk, dv);
+    linear_bwd(A.ctx.data(), w.Wo->data.data(), dx, dctx, w.Wo->grad.data(), R, C, C);
+    attn_backward(A, B, T, dctx, b_dq_, b_dk_, b_dv_);
     // undo RoPE on the query/key gradients (attention used rotated q,k)
-    rope_apply_inv(dq.data(), R, T);
-    rope_apply_inv(dk.data(), R, T);
-    linear_bwd(A.a.data(), w.Wq->data.data(), dq.data(), da_q.data(), w.Wq->grad.data(),
-               R, C, C);
-    linear_bwd(A.a.data(), w.Wk->data.data(), dk.data(), da_k.data(), w.Wk->grad.data(),
-               R, C, C);
-    linear_bwd(A.a.data(), w.Wv->data.data(), dv.data(), da_v.data(), w.Wv->grad.data(),
-               R, C, C);
+    rope_apply_inv(dq, R, T);
+    rope_apply_inv(dk, R, T);
+    linear_bwd(A.a.data(), w.Wq->data.data(), dq, da_q, w.Wq->grad.data(), R, C, C);
+    linear_bwd(A.a.data(), w.Wk->data.data(), dk, da_k, w.Wk->grad.data(), R, C, C);
+    linear_bwd(A.a.data(), w.Wv->data.data(), dv, da_v, w.Wv->grad.data(), R, C, C);
     for (size_t i = 0; i < rc; ++i) da[i] = da_q[i] + da_k[i] + da_v[i];
-    rmsnorm_bwd(A.xin.data(), w.ln1g->data.data(), da.data(), dxin.data(),
-                w.ln1g->grad.data(), A.ln1_rstd.data(), R, C);
+    rmsnorm_bwd(A.xin.data(), w.ln1g->data.data(), da, dxin, w.ln1g->grad.data(),
+                A.ln1_rstd.data(), R, C);
     for (size_t i = 0; i < rc; ++i) dx[i] += dxin[i];  // grad wrt block input
   }
 
@@ -1004,11 +1048,24 @@ void Model::backward(const int* toks) {
   parallel_for(R, [&](int r0, int r1) {
     for (int r = r0; r < r1; ++r) {
       const int t = toks[r];
-      const float* dxr = dx.data() + static_cast<size_t>(r) * C;
+      const float* dxr = dx + static_cast<size_t>(r) * C;
       float* gwte = wte_->grad.data() + static_cast<size_t>(t) * C;
       for (int c = 0; c < C; ++c) gwte[c] += dxr[c];
     }
   });
+}
+
+// Analytic FLOPs per token for one forward + backward of the full model,
+// counting each multiply-add as two FLOPs and the backward as ~2x the forward
+// work (grad-wrt-input and grad-wrt-weight).  Used only for reporting.
+double Model::flops_per_token() const {
+  const double C = C_, Hd = Hd_, V = V_, L = L_;
+  const double T = curT_ > 0 ? curT_ : T_;
+  double macs = 0.0;
+  macs += L * (4.0 * C * C + 3.0 * C * Hd);  // attn projections + SwiGLU MLP
+  macs += L * C * T;                         // attention scores + context (~T*C/token)
+  macs += C * V;                             // final logits projection
+  return macs * 2.0 * 3.0;                   // x2 (FLOP/MAC) x3 (fwd + bwd)
 }
 
 float Model::train_step(const int* toks, const int* tgts, int B, int T) {
