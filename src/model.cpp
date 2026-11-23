@@ -213,6 +213,123 @@ void gemm_bcast(const float* x, const float* W, float* y, int rows, int K, int N
   });
 }
 
+// dW[out][in] += dy[rows][out]^T @ x[rows][in]
+// The weight gradient is a GEMM, not a rank-1 update: the old scalar `saxpy`
+// loop ran at ~1 FMA per two memory ops (memory-bound, ~4x slower).  Here the K
+// dimension (the batch rows) is blocked so the x block stays resident in cache
+// while every output tile streams past it, dy is read transposed through its row
+// stride (no packing copy), and each tile accumulates in SIMD registers before
+// one add-back into dW.  dy and x are each read from memory exactly once.
+void gemm_dw(const float* dy, int dy_stride, const float* x, float* dW, int out,
+             int rows, int in) {
+  if (out <= 0 || rows <= 0 || in <= 0) return;
+#if defined(__AVX2__)
+  constexpr int VW = 8, MR = 4, NV = 2, NR = VW * NV;
+#elif defined(__ARM_NEON)
+  constexpr int VW = 4, MR = 4, NV = 2, NR = VW * NV;
+#else
+  constexpr int VW = 1, MR = 1, NV = 1, NR = 1;
+#endif
+  std::fill(dW, dW + static_cast<size_t>(out) * in, 0.f);
+  if (in % NR != 0) {
+    parallel_for(out, [&](int o0, int o1) {
+      for (int o = o0; o < o1; ++o) {
+        float* dwo = dW + static_cast<size_t>(o) * in;
+        for (int r = 0; r < rows; ++r) {
+          const float g = dy[static_cast<size_t>(r) * dy_stride + o];
+          if (g == 0.f) continue;
+          const float* xr = x + static_cast<size_t>(r) * in;
+          for (int i = 0; i < in; ++i) dwo[i] += g * xr[i];
+        }
+      }
+    });
+    return;
+  }
+  int KC = (512 * 1024) / (in * static_cast<int>(sizeof(float)));
+  if (KC < 64) KC = 64;
+  if (KC > rows) KC = rows;
+  const int ncol = in / NR;
+  for (int k0 = 0; k0 < rows; k0 += KC) {
+    const int K = std::min(KC, rows - k0);
+    const float* dyb = dy + static_cast<size_t>(k0) * dy_stride;
+    const float* xb = x + static_cast<size_t>(k0) * in;
+    const int nrow = (out + MR - 1) / MR;
+    const int ntiles = ncol * nrow;
+    parallel_for(ntiles, [&](int t0, int t1) {
+      for (int t = t0; t < t1; ++t) {
+        const int cb = t / nrow;
+        const int rb = t - cb * nrow;
+        const int i0 = cb * NR;
+        const int o0 = rb * MR;
+#if defined(__AVX2__)
+        __m256 acc[MR][NV];
+        for (int m = 0; m < MR; ++m)
+          for (int v = 0; v < NV; ++v) acc[m][v] = _mm256_setzero_ps();
+        for (int k = 0; k < K; ++k) {
+          const float* wk = xb + static_cast<size_t>(k) * in + i0;
+          const float* dyk = dyb + static_cast<size_t>(k) * dy_stride;
+          __m256 wv[NV];
+          for (int v = 0; v < NV; ++v) wv[v] = _mm256_loadu_ps(wk + v * VW);
+          for (int m = 0; m < MR; ++m) {
+            const int o = o0 + m;
+            if (o >= out) break;
+            const __m256 g = _mm256_set1_ps(dyk[o]);
+            for (int v = 0; v < NV; ++v)
+              acc[m][v] = _mm256_fmadd_ps(g, wv[v], acc[m][v]);
+          }
+        }
+        for (int m = 0; m < MR; ++m) {
+          const int o = o0 + m;
+          if (o >= out) break;
+          for (int v = 0; v < NV; ++v) {
+            float* p = dW + static_cast<size_t>(o) * in + i0 + v * VW;
+            _mm256_storeu_ps(p, _mm256_add_ps(_mm256_loadu_ps(p), acc[m][v]));
+          }
+        }
+#elif defined(__ARM_NEON)
+        float32x4_t acc[MR][NV];
+        for (int m = 0; m < MR; ++m)
+          for (int v = 0; v < NV; ++v) acc[m][v] = vdupq_n_f32(0.f);
+        for (int k = 0; k < K; ++k) {
+          const float* wk = xb + static_cast<size_t>(k) * in + i0;
+          const float* dyk = dyb + static_cast<size_t>(k) * dy_stride;
+          float32x4_t wv[NV];
+          for (int v = 0; v < NV; ++v) wv[v] = vld1q_f32(wk + v * VW);
+          for (int m = 0; m < MR; ++m) {
+            const int o = o0 + m;
+            if (o >= out) break;
+            const float32x4_t g = vdupq_n_f32(dyk[o]);
+            for (int v = 0; v < NV; ++v)
+              acc[m][v] = vmlaq_f32(acc[m][v], g, wv[v]);
+          }
+        }
+        for (int m = 0; m < MR; ++m) {
+          const int o = o0 + m;
+          if (o >= out) break;
+          for (int v = 0; v < NV; ++v) {
+            float* p = dW + static_cast<size_t>(o) * in + i0 + v * VW;
+            vst1q_f32(p, vaddq_f32(vld1q_f32(p), acc[m][v]));
+          }
+        }
+#else
+        for (int m = 0; m < MR; ++m) {
+          const int o = o0 + m;
+          if (o >= out) break;
+          for (int j = 0; j < NR; ++j) {
+            const int i = i0 + j;
+            float s = 0.f;
+            for (int k = 0; k < K; ++k)
+              s += dyb[static_cast<size_t>(k) * dy_stride + o] *
+                   xb[static_cast<size_t>(k) * in + i];
+            dW[static_cast<size_t>(o) * in + i] += s;
+          }
+        }
+#endif
+      }
+    });
+  }
+}
+
 // y[rows,out] = x[rows,in] @ W[out,in]^T   (W row-major [out][in])
 // Cache-blocked over outputs: a block of W rows stays hot while every batch
 // row streams past it, so each weight is fetched from DRAM once per call
@@ -250,33 +367,9 @@ void linear_bwd(const float* x, const float* W, const float* dy, float* dx, floa
     gemm_bcast(dy, W, dx, rows, out, in);
   }
   if (!dW) return;
-  // Output-block outer: the dW block stays hot while every row streams past it,
-  // so x is re-read once per output block.  Size the block as large as the cache
-  // holds comfortably (fewer re-streams) while still leaving at least one task
-  // per worker (all cores busy).
-  int ob = 32;
-  const int fit = static_cast<int>((512 * 1024) / std::max(1, in * 4));
-  if (fit > ob) ob = fit;
-  const int nt = std::max(1, get_threads());
-  const int per_thread = (out + nt - 1) / nt;
-  if (ob > per_thread) ob = per_thread;
-  if (ob > out) ob = out;
-  if (ob < 1) ob = 1;
-  const int nob = (out + ob - 1) / ob;
-  parallel_for(nob, [&](int b0, int b1) {
-    for (int b = b0; b < b1; ++b) {
-      const int o0 = b * ob;
-      const int o1 = std::min(o0 + ob, out);
-      for (int r = 0; r < rows; ++r) {
-        const float* xr = x + static_cast<size_t>(r) * in;
-        const float* dyr = dy + static_cast<size_t>(r) * out;
-        for (int o = o0; o < o1; ++o) {
-          const float g = dyr[o];
-          if (g != 0.f) saxpy(dW + static_cast<size_t>(o) * in, xr, g, in);
-        }
-      }
-    }
-  });
+  // dW[o][i] += sum_r dy[r][o] * x[r][i] — a real GEMM (dy read transposed via
+  // its row stride = out), streamed once for both operands.
+  gemm_dw(dy, out, x, dW, out, rows, in);
 }
 
 // RMSNorm: y = g * x / sqrt(mean(x^2) + eps)
@@ -311,13 +404,17 @@ void rmsnorm_bwd(const float* x, const float* g, const float* dy, float* dx, flo
     }
   });
   if (dg) {
-    for (int i = 0; i < C; ++i) {
-      float sg = 0.f;
-      for (int r = 0; r < rows; ++r)
-        sg += dy[static_cast<size_t>(r) * C + i] * x[static_cast<size_t>(r) * C + i] *
-              rstd[r];
-      dg[i] += sg;
-    }
+    // Parallel over channels: the reduction over rows is strided, so splitting
+    // it across threads matters (it used to run serially).
+    parallel_for(C, [&](int i0, int i1) {
+      for (int i = i0; i < i1; ++i) {
+        float sg = 0.f;
+        for (int r = 0; r < rows; ++r)
+          sg += dy[static_cast<size_t>(r) * C + i] * x[static_cast<size_t>(r) * C + i] *
+                rstd[r];
+        dg[i] += sg;
+      }
+    });
   }
 }
 
