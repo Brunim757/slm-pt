@@ -1,11 +1,11 @@
-# slm-pt
+# KizuSmall
 
-Uma **SLM (Small Language Model) de terminal, escrita do zero em C++** — sem
-nenhum framework de IA, só a STL e o SO. Tokenizador **BPE byte-level** (garante
-a acentuação do português), transformer decoder-only com **RMSNorm + RoPE +
-SwiGLU**, forward/backward implementados à mão, AdamW próprio, **KV cache** para
-inferência rápida, **quantização int8/int4/int2** e **RAG local**. O treino roda
-no **GitHub Actions**.
+O **KizuSmall** é uma **SLM (Small Language Model) de terminal, escrita do zero
+em C++** — sem nenhum framework de IA, só a STL e o SO. Tokenizador **BPE
+byte-level** (garante a acentuação do português), transformer decoder-only com
+**RMSNorm + RoPE + SwiGLU**, forward/backward implementados à mão, AdamW
+próprio, **KV cache** para inferência rápida, **quantização int8/int4/int2** e
+**RAG local**. O treino roda no **GitHub Actions**.
 
 ## Estrutura
 
@@ -114,11 +114,11 @@ compressão) como **artifact**.
 
 ```bash
 # dispara um treino manual
-gh workflow run train.yml -f steps=40000 -f max_minutes=300 -f examples=40000
+gh workflow run train.yml -f steps=40000 -f max_minutes=300 -f canarim_limit=30000
 
 # acompanha e baixa o resultado
 gh run watch
-gh run download --name slm-pt-run
+gh run download --name kizu-small-run
 ```
 
 Como o repositório é **público**, os minutos do Actions são ilimitados. Dá para

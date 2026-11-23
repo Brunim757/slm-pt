@@ -15,13 +15,19 @@ on:
         default: "300"
       examples:
         description: "alpaca pairs limit (0 = all)"
-        default: "4000"
+        default: "8000"
       alpaca_max_chars:
         description: "skip alpaca answers longer than this (0 = keep all)"
         default: "600"
+      canarim_limit:
+        description: "Canarim instruction pairs limit (0 = all)"
+        default: "30000"
+      canarim_max_chars:
+        description: "skip Canarim answers longer than this (0 = keep all)"
+        default: "800"
       chat_weight:
         description: "repeat factor for generated chat"
-        default: "40"
+        default: "12"
       oasst_weight:
         description: "repeat factor for oasst pairs"
         default: "2"
@@ -55,9 +61,10 @@ on:
       quant_bits:
         description: "quantization bits for the report (8/4/2)"
         default: "4"
-  schedule:
-    # Nightly continuation: keep improving the model without manual runs.
-    - cron: "0 3 * * *"
+  # NOTE: the nightly `schedule` is intentionally disabled while KizuSmall's
+  # corpus/tokenizer is still changing: auto-resuming with a different tokenizer
+  # is refused on purpose (it would corrupt the weights). Re-enable it once the
+  # tokenizer is frozen.
 
 permissions:
   contents: read
@@ -81,9 +88,11 @@ jobs:
       - name: Fetch Portuguese corpus
         run: |
           python3 scripts/fetch_corpus.py --out data/corpus.txt \
-            --limit "${{ github.event.inputs.examples || '4000' }}" \
+            --limit "${{ github.event.inputs.examples || '8000' }}" \
             --alpaca-max-chars "${{ github.event.inputs.alpaca_max_chars || '600' }}" \
-            --chat-weight "${{ github.event.inputs.chat_weight || '40' }}" \
+            --canarim-limit "${{ github.event.inputs.canarim_limit || '30000' }}" \
+            --canarim-max-chars "${{ github.event.inputs.canarim_max_chars || '800' }}" \
+            --chat-weight "${{ github.event.inputs.chat_weight || '12' }}" \
             --oasst-weight "${{ github.event.inputs.oasst_weight || '2' }}"
 
       - name: Build
@@ -120,7 +129,8 @@ jobs:
           if [ -n "$RESUME_RUN" ]; then
             echo "resuming from run $RESUME_RUN"
             rm -rf /tmp/prev && mkdir -p /tmp/prev
-            gh run download "$RESUME_RUN" --name slm-pt-run -D /tmp/prev || \
+            gh run download "$RESUME_RUN" --name kizu-small-run -D /tmp/prev || \
+              gh run download "$RESUME_RUN" --name slm-pt-run -D /tmp/prev || \
               gh run download "$RESUME_RUN" -D /tmp/prev || true
             PREV="$(find /tmp/prev -name model.bin -print -quit)"
             if [ -n "$PREV" ]; then cp "$PREV" runs/model.bin; echo "resumed model -> runs/model.bin"; fi
@@ -157,7 +167,7 @@ jobs:
       - name: Upload checkpoint + reports
         uses: actions/upload-artifact@v4
         with:
-          name: slm-pt-run
+          name: kizu-small-run
           path: |
             runs/model.bin
             runs/model_q.bin

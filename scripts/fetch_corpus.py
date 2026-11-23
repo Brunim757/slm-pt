@@ -5,7 +5,9 @@ Sources (all mixed into `### Usuário: / ### Assistente:` blocks):
 
 * a large generated set of **small talk / simple determinate QA** that makes
   greetings and casual questions map to sensible short replies;
-* `dominguesm/alpaca-data-pt-br` — instruction/answer pairs (general knowledge);
+* `dominguesm/Canarim-Instruct-PTBR-Dataset` — 300k+ Portuguese instructions
+  (the main bulk, far richer than the translated alpaca set);
+* `dominguesm/alpaca-data-pt-br` — extra instruction/answer pairs (general);
 * `OpenAssistant/oasst1` — real human Portuguese (pt-BR) conversations.
 
 The generator exists because the instruction corpora alone teach a *generic
@@ -24,6 +26,7 @@ import urllib.request
 
 ALPACA = "dominguesm/alpaca-data-pt-br"
 ALPACA_FALLBACK = "data/train-00000-of-00001-63604ec441480f0e.parquet"
+CANARIM = "dominguesm/Canarim-Instruct-PTBR-Dataset"
 OASST = "OpenAssistant/oasst1"
 OASST_FALLBACK = "data/train-00000-of-00001-b42a775f407cee45.parquet"
 PT_LANGS = {"pt", "pt-BR", "pt_PT", "pt-br"}
@@ -40,6 +43,9 @@ def find_file(dataset, suffix, fallback):
             info = json.load(r)
         files = [s["rfilename"] for s in info.get("siblings", [])]
         hits = [f for f in files if f.endswith(suffix)]
+        train = [f for f in hits if "train" in f.lower()]
+        if train:
+            return train[0]
         if hits:
             return hits[0]
     except Exception as exc:  # noqa: BLE001
@@ -89,13 +95,13 @@ def gen_smalltalk():
          "Vou bem! Como está sendo o seu dia?", "Tudo tranquilo por aqui. E com você?"])
     add(["qual é o seu nome?", "qual seu nome", "como você se chama?",
          "quem é você?", "quem e voce", "seu nome"],
-        ["Sou uma inteligência artificial pequena que fala português. Pode me chamar de SLM!",
-         "Meu nome é SLM, uma IA de terminal que gosta de bater papo em português.",
-         "Sou uma IA feita para conversar em português. E você, como se chama?"])
+        ["Sou uma inteligência artificial pequena que fala português. Pode me chamar de KizuSmall!",
+         "Meu nome é KizuSmall, uma IA de terminal que gosta de bater papo em português.",
+         "Sou o KizuSmall, uma IA feita para conversar em português. E você, como se chama?"])
     add(["o que você é?", "o que voce e", "você é um robô?", "voce e um robo",
          "você é humano?"],
-        ["Sou um programa de computador, um modelo de linguagem. Não sou humano, mas gosto de conversar!",
-         "Sou uma IA, um modelo de linguagem treinado para entender e falar português."])
+        ["Sou um programa de computador, um modelo de linguagem chamado KizuSmall. Não sou humano, mas gosto de conversar!",
+         "Sou o KizuSmall, uma IA, um modelo de linguagem treinado para entender e falar português."])
     add(["o que você faz?", "o que voce faz", "para que você serve?",
          "o que você sabe fazer?", "você pode me ajudar?", "pode me ajudar?"],
         ["Eu converso! Posso responder perguntas, dar ideias e bater papo em português.",
@@ -240,6 +246,11 @@ def main():
     ap.add_argument("--limit", type=int, default=0, help="max alpaca examples (0 = all)")
     ap.add_argument("--alpaca-max-chars", type=int, default=0,
                     help="skip alpaca answers longer than this (0 = keep all)")
+    ap.add_argument("--canarim", type=int, default=1, help="include Canarim (0/1)")
+    ap.add_argument("--canarim-limit", type=int, default=40000,
+                    help="max Canarim examples (0 = all)")
+    ap.add_argument("--canarim-max-chars", type=int, default=800,
+                    help="skip Canarim answers longer than this (0 = keep all)")
     ap.add_argument("--chat-weight", type=int, default=3, help="repeat generated chat")
     ap.add_argument("--oasst-weight", type=int, default=2, help="repeat oasst pairs")
     ap.add_argument("--oasst", type=int, default=1, help="include oasst1 pt pairs (0/1)")
@@ -255,7 +266,7 @@ def main():
 
     chat = gen_smalltalk()
     written = 0
-    n_st = n_alp = n_oas = 0
+    n_st = n_alp = n_oas = n_can = 0
     tmpdir = tempfile.mkdtemp()
     with open(args.out, "w", encoding="utf-8") as f:
         # 1) generated chat (weighted, shuffled so frames spread across the file)
@@ -297,6 +308,41 @@ def main():
                 n_alp += 1
             print(f"  alpaca: {n_alp} examples", file=sys.stderr)
 
+            # 2b) Canarim — 300k+ Portuguese instructions (the main bulk).
+            if args.canarim:
+                parquet = find_file(CANARIM, ".parquet", "")
+                if not parquet:
+                    print("  (canarim skipped: no parquet found)", file=sys.stderr)
+                else:
+                    url = f"https://huggingface.co/datasets/{CANARIM}/resolve/main/{parquet}"
+                    path = os.path.join(tmpdir, "canarim.parquet")
+                    print(f"downloading {parquet} ...", file=sys.stderr)
+                    try:
+                        download(url, path)
+                        cols = ["instruction", "input", "output"]
+                        t = pq.read_table(path, columns=cols).to_pydict()
+                        n = len(t["instruction"])
+                        lim = args.canarim_limit if args.canarim_limit > 0 else n
+                        lim = min(lim, n)
+                        rows = []
+                        for i in range(lim):
+                            instr = (t["instruction"][i] or "").strip()
+                            inp = (t["input"][i] or "").strip()
+                            out = (t["output"][i] or "").strip()
+                            if not instr or not out:
+                                continue
+                            if args.canarim_max_chars > 0 and len(out) > args.canarim_max_chars:
+                                continue
+                            rows.append(fmt(instr, inp, out))
+                        random.shuffle(rows)
+                        for ex in rows:
+                            f.write(ex)
+                            written += 1
+                            n_can += 1
+                    except Exception as exc:  # noqa: BLE001
+                        print(f"  (canarim skipped: {exc})", file=sys.stderr)
+                print(f"  canarim: {n_can} examples", file=sys.stderr)
+
             # 3) oasst pt-BR conversations
             if args.oasst:
                 parquet = find_file(OASST, ".parquet", OASST_FALLBACK)
@@ -335,7 +381,7 @@ def main():
     shutil.rmtree(tmpdir, ignore_errors=True)
     size = os.path.getsize(args.out)
     print(f"wrote {written} examples ({size / 1048576:.2f} MB) to {args.out} "
-          f"[chat={n_st} alpaca={n_alp} oasst={n_oas}]", file=sys.stderr)
+          f"[chat={n_st} canarim={n_can} alpaca={n_alp} oasst={n_oas}]", file=sys.stderr)
 
 
 if __name__ == "__main__":

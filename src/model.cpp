@@ -43,6 +43,59 @@ inline float dot_f32(const float* a, const float* b, int n) {
 #endif
 }
 
+// Four dot products at once: out[k] = dot(x, w[k]) for k = 0..3.
+// Uses one independent accumulator per output so the FMA latency is hidden by
+// instruction-level parallelism (a single accumulator chain runs ~4x slower),
+// and loads x once per 4-wide chunk to feed all four outputs.
+inline void dot4_f32(const float* x, const float* w0, const float* w1,
+                     const float* w2, const float* w3, int n, float* out) {
+#if defined(__ARM_NEON)
+  float32x4_t a0 = vdupq_n_f32(0.f), a1 = a0, a2 = a0, a3 = a0;
+  int i = 0;
+  for (; i + 4 <= n; i += 4) {
+    const float32x4_t xv = vld1q_f32(x + i);
+    a0 = vmlaq_f32(a0, xv, vld1q_f32(w0 + i));
+    a1 = vmlaq_f32(a1, xv, vld1q_f32(w1 + i));
+    a2 = vmlaq_f32(a2, xv, vld1q_f32(w2 + i));
+    a3 = vmlaq_f32(a3, xv, vld1q_f32(w3 + i));
+  }
+  float s0 = vaddvq_f32(a0), s1 = vaddvq_f32(a1);
+  float s2 = vaddvq_f32(a2), s3 = vaddvq_f32(a3);
+  for (; i < n; ++i) {
+    const float xv = x[i];
+    s0 += xv * w0[i]; s1 += xv * w1[i]; s2 += xv * w2[i]; s3 += xv * w3[i];
+  }
+  out[0] = s0; out[1] = s1; out[2] = s2; out[3] = s3;
+#elif defined(__AVX2__)
+  __m256 a0 = _mm256_setzero_ps(), a1 = a0, a2 = a0, a3 = a0;
+  int i = 0;
+  for (; i + 8 <= n; i += 8) {
+    const __m256 xv = _mm256_loadu_ps(x + i);
+    a0 = _mm256_fmadd_ps(xv, _mm256_loadu_ps(w0 + i), a0);
+    a1 = _mm256_fmadd_ps(xv, _mm256_loadu_ps(w1 + i), a1);
+    a2 = _mm256_fmadd_ps(xv, _mm256_loadu_ps(w2 + i), a2);
+    a3 = _mm256_fmadd_ps(xv, _mm256_loadu_ps(w3 + i), a3);
+  }
+  auto hsum = [](__m256 v) {
+    float t[8]; _mm256_storeu_ps(t, v);
+    return t[0] + t[1] + t[2] + t[3] + t[4] + t[5] + t[6] + t[7];
+  };
+  float s0 = hsum(a0), s1 = hsum(a1), s2 = hsum(a2), s3 = hsum(a3);
+  for (; i < n; ++i) {
+    const float xv = x[i];
+    s0 += xv * w0[i]; s1 += xv * w1[i]; s2 += xv * w2[i]; s3 += xv * w3[i];
+  }
+  out[0] = s0; out[1] = s1; out[2] = s2; out[3] = s3;
+#else
+  float s0 = 0.f, s1 = 0.f, s2 = 0.f, s3 = 0.f;
+  for (int i = 0; i < n; ++i) {
+    const float xv = x[i];
+    s0 += xv * w0[i]; s1 += xv * w1[i]; s2 += xv * w2[i]; s3 += xv * w3[i];
+  }
+  out[0] = s0; out[1] = s1; out[2] = s2; out[3] = s3;
+#endif
+}
+
 // y += a * x
 inline void saxpy(float* y, const float* x, float a, int n) {
 #if defined(__ARM_NEON)
@@ -69,10 +122,14 @@ void linear_fwd(const float* x, const float* W, float* y, int rows, int in, int 
     for (int r = r0; r < r1; ++r) {
       const float* xr = x + static_cast<size_t>(r) * in;
       float* yr = y + static_cast<size_t>(r) * out;
-      for (int o = 0; o < out; ++o) {
-        const float* wo = W + static_cast<size_t>(o) * in;
-        yr[o] = dot_f32(xr, wo, in);
+      int o = 0;
+      for (; o + 4 <= out; o += 4) {
+        dot4_f32(xr, W + static_cast<size_t>(o + 0) * in,
+                 W + static_cast<size_t>(o + 1) * in,
+                 W + static_cast<size_t>(o + 2) * in,
+                 W + static_cast<size_t>(o + 3) * in, in, yr + o);
       }
+      for (; o < out; ++o) yr[o] = dot_f32(xr, W + static_cast<size_t>(o) * in, in);
     }
   });
 }
@@ -96,14 +153,22 @@ void linear_bwd(const float* x, const float* W, const float* dy, float* dx, floa
     });
   }
   if (!dW) return;
-  parallel_for(out, [&](int o0, int o1) {
-    for (int o = o0; o < o1; ++o) {
-      float* dwo = dW + static_cast<size_t>(o) * in;
+  // Block four output rows together: x[r] is loaded once and reused by all
+  // four saxpy updates, cutting x traffic by 4x.
+  const int ob = (out + 3) / 4;
+  parallel_for(ob, [&](int b0, int b1) {
+    for (int b = b0; b < b1; ++b) {
+      const int o = b * 4;
+      const int cnt = (out - o < 4) ? (out - o) : 4;
+      float* dw[4] = {nullptr, nullptr, nullptr, nullptr};
+      for (int k = 0; k < cnt; ++k) dw[k] = dW + static_cast<size_t>(o + k) * in;
       for (int r = 0; r < rows; ++r) {
-        const float g = dy[static_cast<size_t>(r) * out + o];
-        if (g == 0.f) continue;
         const float* xr = x + static_cast<size_t>(r) * in;
-        saxpy(dwo, xr, g, in);
+        const float* dyr = dy + static_cast<size_t>(r) * out;
+        for (int k = 0; k < cnt; ++k) {
+          const float g = dyr[o + k];
+          if (g != 0.f) saxpy(dw[k], xr, g, in);
+        }
       }
     }
   });
@@ -415,8 +480,7 @@ void Model::attn_forward(LayerActs& A, int B, int T) {
         for (int j = 0; j <= i; ++j) {
           const int rj = b * T + j;
           const float* vj = A.v.data() + static_cast<size_t>(rj) * C + h * hd;
-          const float p = pr[i * T + j];
-          for (int d = 0; d < hd; ++d) ci[d] += p * vj[d];
+          saxpy(ci, vj, pr[i * T + j], hd);
         }
       }
     }
@@ -448,21 +512,18 @@ void Model::attn_backward(LayerActs& A, int B, int T, const float* dctx,
         for (int j = 0; j <= i; ++j) {
           const int rj = b * T + j;
           float* dvj = dv.data() + static_cast<size_t>(rj) * C + h * hd;
-          const float p = pr[i * T + j];
-          for (int d = 0; d < hd; ++d) dvj[d] += p * dci[d];
+          saxpy(dvj, dci, pr[i * T + j], hd);
         }
         float dot = 0.f;
         for (int j = 0; j <= i; ++j) dot += pr[i * T + j] * dp[j];
+        float* dqi = dq.data() + static_cast<size_t>(ri) * C + h * hd;
         for (int j = 0; j <= i; ++j) {
           const float dsc = pr[i * T + j] * (dp[j] - dot) * scale;
           const int rj = b * T + j;
           const float* kj = A.k.data() + static_cast<size_t>(rj) * C + h * hd;
-          float* dqi = dq.data() + static_cast<size_t>(ri) * C + h * hd;
           float* dkj = dk.data() + static_cast<size_t>(rj) * C + h * hd;
-          for (int d = 0; d < hd; ++d) {
-            dqi[d] += dsc * kj[d];
-            dkj[d] += dsc * qi[d];
-          }
+          saxpy(dqi, kj, dsc, hd);
+          saxpy(dkj, qi, dsc, hd);
         }
       }
     }

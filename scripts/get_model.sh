@@ -14,7 +14,8 @@ fi
 tmp="$(mktemp -d)"
 trap 'rm -rf "$tmp"' EXIT
 echo "downloading artifact from run $run_id ..."
-gh run download "$run_id" --name slm-pt-run -D "$tmp"
+gh run download "$run_id" --name kizu-small-run -D "$tmp" 2>/dev/null || \
+  gh run download "$run_id" --name slm-pt-run -D "$tmp"
 
 model="$(find "$tmp" -name model.bin -print -quit)"
 [ -n "$model" ] || { echo "model.bin not found in artifact"; exit 1; }

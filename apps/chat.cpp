@@ -56,7 +56,7 @@ int main(int argc, char** argv) {
     std::fprintf(stderr, "WARN: no tokenizer found, using raw bytes\n");
   }
 
-  std::printf("slm-pt chat (BPE, vocab %d) — digite e pressione Enter. /sair para sair.\n",
+  std::printf("KizuSmall chat (BPE, vocab %d) — digite e pressione Enter. /sair para sair.\n",
               tok.vocab_size());
   std::printf("modelo: %s (embd=%d layer=%d head=%d block=%d)\n\n", path.c_str(),
               cfg.n_embd, cfg.n_layer, cfg.n_head, cfg.block);

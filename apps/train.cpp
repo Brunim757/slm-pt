@@ -97,7 +97,7 @@ int main(int argc, char** argv) {
   Model model(cfg);
   long params = 0;
   for (Param* p : model.params()) params += (long)p->size();
-  std::printf("== slm-pt ==\n");
+  std::printf("== KizuSmall ==\n");
   std::printf("arch: embd=%d layer=%d head=%d block=%d batch=%d mlp=%d vocab=%d\n",
               cfg.n_embd, cfg.n_layer, cfg.n_head, cfg.block, cfg.batch, model.hidden(),
               cfg.vocab);
