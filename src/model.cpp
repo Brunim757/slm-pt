@@ -1,6 +1,7 @@
 #include "slmpt/model.hpp"
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -249,14 +250,23 @@ void linear_bwd(const float* x, const float* W, const float* dy, float* dx, floa
     gemm_bcast(dy, W, dx, rows, out, in);
   }
   if (!dW) return;
-  // Output-block outer: the dW block stays in cache while rows stream past it,
-  // and each output row of dW is owned by exactly one task.
-  constexpr int OB = 32;
-  const int nob = (out + OB - 1) / OB;
+  // Output-block outer: the dW block stays hot while every row streams past it,
+  // so x is re-read once per output block.  Size the block as large as the cache
+  // holds comfortably (fewer re-streams) while still leaving at least one task
+  // per worker (all cores busy).
+  int ob = 32;
+  const int fit = static_cast<int>((512 * 1024) / std::max(1, in * 4));
+  if (fit > ob) ob = fit;
+  const int nt = std::max(1, get_threads());
+  const int per_thread = (out + nt - 1) / nt;
+  if (ob > per_thread) ob = per_thread;
+  if (ob > out) ob = out;
+  if (ob < 1) ob = 1;
+  const int nob = (out + ob - 1) / ob;
   parallel_for(nob, [&](int b0, int b1) {
     for (int b = b0; b < b1; ++b) {
-      const int o0 = b * OB;
-      const int o1 = std::min(o0 + OB, out);
+      const int o0 = b * ob;
+      const int o1 = std::min(o0 + ob, out);
       for (int r = 0; r < rows; ++r) {
         const float* xr = x + static_cast<size_t>(r) * in;
         const float* dyr = dy + static_cast<size_t>(r) * out;
@@ -393,23 +403,33 @@ void Model::init_params() {
 
 void Model::sync_transposed() {
   auto tr = [](const Param* W, int out, int in, std::vector<float>& t) {
-    t.resize(static_cast<size_t>(in) * out);
+    const size_t need = static_cast<size_t>(in) * out;
+    if (t.size() != need) t.assign(need, 0.f);
     for (int o = 0; o < out; ++o) {
       const float* row = W->data.data() + static_cast<size_t>(o) * in;
       for (int i = 0; i < in; ++i) t[static_cast<size_t>(i) * out + o] = row[i];
     }
   };
+  // Flatten every (weight -> transposed buffer) pair into one list and fan it
+  // out across threads; the transposes are independent and embarrassingly
+  // parallel, and this ran serially (strided) on every forward before.
+  struct Task { const Param* w; int out, in; std::vector<float>* t; };
+  std::vector<Task> tasks;
+  tasks.reserve(static_cast<size_t>(L_) * 7 + 1);
   for (int l = 0; l < L_; ++l) {
     LayerWeights& w = layers_[l];
-    tr(w.Wq, C_, C_, w.tq);
-    tr(w.Wk, C_, C_, w.tk);
-    tr(w.Wv, C_, C_, w.tv);
-    tr(w.Wo, C_, C_, w.to);
-    tr(w.W1, Hd_, C_, w.t1);
-    tr(w.W3, Hd_, C_, w.t3);
-    tr(w.W2, C_, Hd_, w.t2);
+    tasks.push_back({w.Wq, C_, C_, &w.tq});
+    tasks.push_back({w.Wk, C_, C_, &w.tk});
+    tasks.push_back({w.Wv, C_, C_, &w.tv});
+    tasks.push_back({w.Wo, C_, C_, &w.to});
+    tasks.push_back({w.W1, Hd_, C_, &w.t1});
+    tasks.push_back({w.W3, Hd_, C_, &w.t3});
+    tasks.push_back({w.W2, C_, Hd_, &w.t2});
   }
-  tr(wte_, V_, C_, twte_);
+  tasks.push_back({wte_, V_, C_, &twte_});
+  parallel_for(static_cast<int>(tasks.size()), [&](int a, int b) {
+    for (int k = a; k < b; ++k) tr(tasks[k].w, tasks[k].out, tasks[k].in, *tasks[k].t);
+  });
 }
 
 void Model::reallocate(int batch) {
@@ -650,7 +670,10 @@ void Model::attn_backward(LayerActs& A, int B, int T, const float* dctx,
 
 double Model::cross_entropy(const int* tgts) {
   const int R = curR_, V = V_;
-  double total = 0.0;
+  const float invR = 1.f / static_cast<float>(R);
+  std::vector<float> rl(static_cast<size_t>(R), 0.f);
+  // Single pass per row: softmax for the gradient AND the loss, both scaled by
+  // 1/R here so there is no second serial sweep over dlogits afterwards.
   parallel_for(R, [&](int r0, int r1) {
     for (int r = r0; r < r1; ++r) {
       const float* lg = logits_.data() + static_cast<size_t>(r) * V;
@@ -663,21 +686,14 @@ double Model::cross_entropy(const int* tgts) {
         dl[v] = e;
         sum += e;
       }
-      const float inv = 1.f / sum;
-      for (int v = 0; v < V; ++v) dl[v] *= inv;
-      dl[tgts[r]] -= 1.f;
+      const float invsum = invR / sum;
+      for (int v = 0; v < V; ++v) dl[v] *= invsum;
+      dl[tgts[r]] -= invR;
+      rl[r] = mx + std::log(sum) - lg[tgts[r]];
     }
   });
-  for (int r = 0; r < R; ++r) {
-    const float* lg = logits_.data() + static_cast<size_t>(r) * V;
-    float mx = -1e30f;
-    for (int v = 0; v < V; ++v) mx = std::max(mx, lg[v]);
-    float sum = 0.f;
-    for (int v = 0; v < V; ++v) sum += std::exp(lg[v] - mx);
-    total += static_cast<double>(mx + std::log(sum)) - lg[tgts[r]];
-  }
-  const float invR = 1.f / R;
-  for (float& d : dlogits_) d *= invR;
+  double total = 0.0;
+  for (int r = 0; r < R; ++r) total += rl[r];
   return total / R;
 }
 
@@ -757,6 +773,26 @@ float Model::train_step(const int* toks, const int* tgts, int B, int T) {
   forward(toks, B, T);
   const double loss = cross_entropy(tgts);
   backward(toks);
+  return static_cast<float>(loss);
+}
+
+float Model::train_step_prof(const int* toks, const int* tgts, int B, int T, double* t_fwd,
+                             double* t_ce, double* t_bwd) {
+  using clock = std::chrono::steady_clock;
+  auto ms = [](clock::time_point a, clock::time_point b) {
+    return std::chrono::duration<double>(b - a).count();
+  };
+  zero_grad();
+  auto t0 = clock::now();
+  forward(toks, B, T);
+  auto t1 = clock::now();
+  const double loss = cross_entropy(tgts);
+  auto t2 = clock::now();
+  backward(toks);
+  auto t3 = clock::now();
+  if (t_fwd) *t_fwd = ms(t0, t1);
+  if (t_ce) *t_ce = ms(t1, t2);
+  if (t_bwd) *t_bwd = ms(t2, t3);
   return static_cast<float>(loss);
 }
 

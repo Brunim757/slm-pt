@@ -61,6 +61,9 @@ on:
       quant_bits:
         description: "quantization bits for the report (8/4/2)"
         default: "4"
+      profile:
+        description: "print per-phase step timing (1 = on)"
+        default: "0"
   # NOTE: the nightly `schedule` is intentionally disabled while KizuSmall's
   # corpus/tokenizer is still changing: auto-resuming with a different tokenizer
   # is refused on purpose (it would corrupt the weights). Re-enable it once the
@@ -137,6 +140,8 @@ jobs:
           fi
 
       - name: Train
+        env:
+          SLMPT_PROFILE: ${{ github.event.inputs.profile || '0' }}
         run: |
           mkdir -p runs
           RESUME=""

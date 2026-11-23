@@ -103,7 +103,9 @@ int main(int argc, char** argv) {
               cfg.vocab);
   std::printf("params: %.2f M   threads: %d   rope_theta=%.0f\n", params / 1e6,
               get_threads(), cfg.rope_theta);
-#if defined(__AVX2__)
+#if defined(__AVX512F__)
+  std::printf("simd: AVX512+FMA (16-wide)   gemm: tiled broadcast\n");
+#elif defined(__AVX2__)
   std::printf("simd: AVX2+FMA (8-wide)   gemm: tiled broadcast\n");
 #elif defined(__ARM_NEON)
   std::printf("simd: NEON (4-wide)   gemm: tiled broadcast\n");
@@ -152,9 +154,20 @@ int main(int argc, char** argv) {
   int last_step = 0;
   long tokens_seen = 0;
 
+  // Optional phase profiling: SLMPT_PROFILE=1 prints where the step time goes.
+  const char* prof_env = std::getenv("SLMPT_PROFILE");
+  const bool prof = prof_env && prof_env[0] && std::strcmp(prof_env, "0") != 0;
+  double pf_fwd = 0, pf_ce = 0, pf_bwd = 0, pf_opt = 0;
+  double pf_win = t0;
+
   for (int step = 1; step <= cfg.max_steps; ++step) {
     ds.random_batch(rng, cfg.batch, cfg.block, toks, tgts);
-    const float loss = model.train_step(toks.data(), tgts.data(), cfg.batch, cfg.block);
+    double w_fwd = 0, w_ce = 0, w_bwd = 0;
+    const float loss = prof
+        ? model.train_step_prof(toks.data(), tgts.data(), cfg.batch, cfg.block,
+                                &w_fwd, &w_ce, &w_bwd)
+        : model.train_step(toks.data(), tgts.data(), cfg.batch, cfg.block);
+    pf_fwd += w_fwd; pf_ce += w_ce; pf_bwd += w_bwd;
 
     float lr = cfg.lr;
     if (step <= cfg.warmup)
@@ -165,7 +178,9 @@ int main(int argc, char** argv) {
       lr *= 0.5f * (1.f + std::cos(3.14159265f * p));
     }
     opt.set_lr(lr);
+    const double pe = now_s();
     opt.step(model.params(), step);
+    pf_opt += now_s() - pe;
 
     tokens_seen += (long)cfg.batch * cfg.block;
     const double t = now_s();
@@ -178,6 +193,17 @@ int main(int argc, char** argv) {
       std::fflush(stdout);
       last_log = t;
       last_step = step;
+    }
+
+    if (prof && step % 10 == 0) {
+      const double n = 10.0;
+      const double win = (t - pf_win);
+      std::printf("  [prof] fwd %.2f ms | ce %.2f ms | bwd %.2f ms | opt %.2f ms | other %.2f ms (step %.2f ms)\n",
+                  pf_fwd / n * 1e3, pf_ce / n * 1e3, pf_bwd / n * 1e3, pf_opt / n * 1e3,
+                  (win - (pf_fwd + pf_ce + pf_bwd + pf_opt)) / n * 1e3, win / n * 1e3);
+      std::fflush(stdout);
+      pf_fwd = pf_ce = pf_bwd = pf_opt = 0;
+      pf_win = t;
     }
 
     if (cfg.sample_every > 0 && step % cfg.sample_every == 0) {

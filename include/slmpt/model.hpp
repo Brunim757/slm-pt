@@ -54,6 +54,11 @@ class Model {
   // Returns the mean cross-entropy loss. Gradients are left in params().
   float train_step(const int* toks, const int* tgts, int B, int T);
 
+  // Same as train_step, but also reports the wall-clock seconds spent in each
+  // phase (forward / cross-entropy / backward) through the given pointers.
+  float train_step_prof(const int* toks, const int* tgts, int B, int T, double* t_fwd,
+                        double* t_ce, double* t_bwd);
+
   // Forward only. Logits end up in last_logits().
   void forward(const int* toks, int B, int T);
 
