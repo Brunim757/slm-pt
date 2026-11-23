@@ -43,6 +43,26 @@ inline float dot_f32(const float* a, const float* b, int n) {
 #endif
 }
 
+// y += a * x
+inline void saxpy(float* y, const float* x, float a, int n) {
+#if defined(__ARM_NEON)
+  const float32x4_t va = vdupq_n_f32(a);
+  int i = 0;
+  for (; i + 4 <= n; i += 4)
+    vst1q_f32(y + i, vmlaq_f32(vld1q_f32(y + i), va, vld1q_f32(x + i)));
+  for (; i < n; ++i) y[i] += a * x[i];
+#elif defined(__AVX2__)
+  const __m256 va = _mm256_set1_ps(a);
+  int i = 0;
+  for (; i + 8 <= n; i += 8)
+    _mm256_storeu_ps(y + i,
+                     _mm256_fmadd_ps(va, _mm256_loadu_ps(x + i), _mm256_loadu_ps(y + i)));
+  for (; i < n; ++i) y[i] += a * x[i];
+#else
+  for (int i = 0; i < n; ++i) y[i] += a * x[i];
+#endif
+}
+
 // y[rows,out] = x[rows,in] @ W[out,in]^T   (W row-major [out][in])
 void linear_fwd(const float* x, const float* W, float* y, int rows, int in, int out) {
   parallel_for(rows, [&](int r0, int r1) {
@@ -70,7 +90,7 @@ void linear_bwd(const float* x, const float* W, const float* dy, float* dx, floa
           const float g = dyr[o];
           if (g == 0.f) continue;
           const float* wo = W + static_cast<size_t>(o) * in;
-          for (int i = 0; i < in; ++i) dxr[i] += g * wo[i];
+          saxpy(dxr, wo, g, in);
         }
       }
     });
@@ -83,7 +103,7 @@ void linear_bwd(const float* x, const float* W, const float* dy, float* dx, floa
         const float g = dy[static_cast<size_t>(r) * out + o];
         if (g == 0.f) continue;
         const float* xr = x + static_cast<size_t>(r) * in;
-        for (int i = 0; i < in; ++i) dwo[i] += g * xr[i];
+        saxpy(dwo, xr, g, in);
       }
     }
   });

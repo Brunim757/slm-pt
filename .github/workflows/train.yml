@@ -9,28 +9,31 @@ on:
     inputs:
       steps:
         description: "max training steps"
-        default: "40000"
+        default: "30000"
       max_minutes:
         description: "wall-clock budget (minutes)"
         default: "300"
       examples:
         description: "alpaca pairs limit (0 = all)"
-        default: "40000"
+        default: "4000"
+      alpaca_max_chars:
+        description: "skip alpaca answers longer than this (0 = keep all)"
+        default: "600"
       chat_weight:
         description: "repeat factor for generated chat"
-        default: "6"
+        default: "40"
       oasst_weight:
         description: "repeat factor for oasst pairs"
         default: "2"
       bpe_vocab:
         description: "BPE vocabulary size"
-        default: "8192"
+        default: "4096"
       embd:
         description: "embedding dim"
-        default: "384"
+        default: "256"
       layer:
         description: "number of layers"
-        default: "8"
+        default: "6"
       head:
         description: "attention heads"
         default: "8"
@@ -42,7 +45,7 @@ on:
         default: "32"
       lr:
         description: "learning rate"
-        default: "3e-4"
+        default: "4e-4"
       resume_run:
         description: "run id to resume from (empty = fresh)"
         default: ""
@@ -78,8 +81,9 @@ jobs:
       - name: Fetch Portuguese corpus
         run: |
           python3 scripts/fetch_corpus.py --out data/corpus.txt \
-            --limit "${{ github.event.inputs.examples || '40000' }}" \
-            --chat-weight "${{ github.event.inputs.chat_weight || '6' }}" \
+            --limit "${{ github.event.inputs.examples || '4000' }}" \
+            --alpaca-max-chars "${{ github.event.inputs.alpaca_max_chars || '600' }}" \
+            --chat-weight "${{ github.event.inputs.chat_weight || '40' }}" \
             --oasst-weight "${{ github.event.inputs.oasst_weight || '2' }}"
 
       - name: Build
@@ -90,7 +94,7 @@ jobs:
       - name: Train BPE tokenizer
         run: |
           ./build/slmpt_bpe --in data/corpus.txt --out data/tokenizer.txt \
-            --ids data/corpus.ids --vocab "${{ github.event.inputs.bpe_vocab || '8192' }}"
+            --ids data/corpus.ids --vocab "${{ github.event.inputs.bpe_vocab || '4096' }}"
 
       - name: Gradient check
         run: ./build/slmpt_gradcheck
@@ -115,9 +119,11 @@ jobs:
           mkdir -p runs
           if [ -n "$RESUME_RUN" ]; then
             echo "resuming from run $RESUME_RUN"
-            gh run download "$RESUME_RUN" --name slm-pt-run -D runs || \
-              gh run download "$RESUME_RUN" -D runs || true
-            find runs -name model.bin
+            rm -rf /tmp/prev && mkdir -p /tmp/prev
+            gh run download "$RESUME_RUN" --name slm-pt-run -D /tmp/prev || \
+              gh run download "$RESUME_RUN" -D /tmp/prev || true
+            PREV="$(find /tmp/prev -name model.bin -print -quit)"
+            if [ -n "$PREV" ]; then cp "$PREV" runs/model.bin; echo "resumed model -> runs/model.bin"; fi
           fi
 
       - name: Train
@@ -127,13 +133,13 @@ jobs:
           if [ -f runs/model.bin ]; then RESUME="--resume runs/model.bin"; fi
           ./build/slmpt_train --data data/corpus.txt --ids data/corpus.ids \
             --tokenizer data/tokenizer.txt --out runs \
-            --embd ${{ github.event.inputs.embd || '384' }} \
-            --layer ${{ github.event.inputs.layer || '8' }} \
+            --embd ${{ github.event.inputs.embd || '256' }} \
+            --layer ${{ github.event.inputs.layer || '6' }} \
             --head ${{ github.event.inputs.head || '8' }} \
             --block ${{ github.event.inputs.block || '256' }} \
             --batch ${{ github.event.inputs.batch || '32' }} \
-            --lr ${{ github.event.inputs.lr || '3e-4' }} \
-            --steps ${{ github.event.inputs.steps || '40000' }} \
+            --lr ${{ github.event.inputs.lr || '4e-4' }} \
+            --steps ${{ github.event.inputs.steps || '30000' }} \
             --max-minutes ${{ github.event.inputs.max_minutes || '300' }} \
             --save-every 500 --sample-every 500 --threads "$(nproc)" $RESUME
 

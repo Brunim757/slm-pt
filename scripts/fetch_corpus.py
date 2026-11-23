@@ -238,6 +238,8 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--out", default="data/corpus.txt")
     ap.add_argument("--limit", type=int, default=0, help="max alpaca examples (0 = all)")
+    ap.add_argument("--alpaca-max-chars", type=int, default=0,
+                    help="skip alpaca answers longer than this (0 = keep all)")
     ap.add_argument("--chat-weight", type=int, default=3, help="repeat generated chat")
     ap.add_argument("--oasst-weight", type=int, default=2, help="repeat oasst pairs")
     ap.add_argument("--oasst", type=int, default=1, help="include oasst1 pt pairs (0/1)")
@@ -287,6 +289,8 @@ def main():
                 inp = (t["input"][i] or "").strip()
                 out = (t["output"][i] or "").strip()
                 if not instr or not out:
+                    continue
+                if args.alpaca_max_chars > 0 and len(out) > args.alpaca_max_chars:
                     continue
                 f.write(fmt(instr, inp, out))
                 written += 1
