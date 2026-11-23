@@ -14,9 +14,12 @@ using namespace slmpt;
 int main() {
   Config c;
   c.vocab = 256;
-  c.n_embd = 16;
+  // Dims chosen as multiples of the widest SIMD register (32 floats) so the
+  // finite-difference check exercises the vectorized GEMM kernels, not just the
+  // scalar fallback.
+  c.n_embd = 32;
   c.n_layer = 2;
-  c.n_head = 2;
+  c.n_head = 4;
   c.block = 8;
   c.batch = 2;
   c.seed = 7;

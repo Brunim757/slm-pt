@@ -11,7 +11,7 @@
 
 #if defined(__ARM_NEON)
 #include <arm_neon.h>
-#elif defined(__AVX2__)
+#elif defined(__AVX512F__) || defined(__AVX2__)
 #include <immintrin.h>
 #endif
 
@@ -124,7 +124,9 @@ inline void saxpy(float* y, const float* x, float a, int n) {
 // for the forward pass (W = transposed weight) and for dx in the backward pass.
 void gemm_bcast(const float* x, const float* W, float* y, int rows, int K, int N) {
   if (rows <= 0 || K <= 0 || N <= 0) return;
-#if defined(__AVX2__)
+#if defined(__AVX512F__)
+  constexpr int VW = 16, MR = 6, NV = 2, NR = VW * NV;  // 6 rows x 32 outputs
+#elif defined(__AVX2__)
   constexpr int VW = 8, MR = 4, NV = 2, NR = VW * NV;  // 4 rows x 16 outputs
 #elif defined(__ARM_NEON)
   constexpr int VW = 4, MR = 4, NV = 2, NR = VW * NV;  // 4 rows x 8 outputs
@@ -152,7 +154,29 @@ void gemm_bcast(const float* x, const float* W, float* y, int rows, int K, int N
       const int rb = t - cb * nrow;
       const int o0 = cb * NR;
       const int r0 = rb * MR;
-#if defined(__AVX2__)
+#if defined(__AVX512F__)
+      __m512 acc[MR][NV];
+      for (int m = 0; m < MR; ++m)
+        for (int v = 0; v < NV; ++v) acc[m][v] = _mm512_setzero_ps();
+      for (int k = 0; k < K; ++k) {
+        const float* wk = W + static_cast<size_t>(k) * N + o0;
+        __m512 wv[NV];
+        for (int v = 0; v < NV; ++v) wv[v] = _mm512_loadu_ps(wk + v * VW);
+        for (int m = 0; m < MR; ++m) {
+          const int r = r0 + m;
+          if (r >= rows) break;
+          const __m512 xv = _mm512_set1_ps(x[static_cast<size_t>(r) * K + k]);
+          for (int v = 0; v < NV; ++v)
+            acc[m][v] = _mm512_fmadd_ps(xv, wv[v], acc[m][v]);
+        }
+      }
+      for (int m = 0; m < MR; ++m) {
+        const int r = r0 + m;
+        if (r >= rows) break;
+        for (int v = 0; v < NV; ++v)
+          _mm512_storeu_ps(y + static_cast<size_t>(r) * N + o0 + v * VW, acc[m][v]);
+      }
+#elif defined(__AVX2__)
       __m256 acc[MR][NV];
       for (int m = 0; m < MR; ++m)
         for (int v = 0; v < NV; ++v) acc[m][v] = _mm256_setzero_ps();
@@ -223,7 +247,9 @@ void gemm_bcast(const float* x, const float* W, float* y, int rows, int K, int N
 void gemm_dw(const float* dy, int dy_stride, const float* x, float* dW, int out,
              int rows, int in) {
   if (out <= 0 || rows <= 0 || in <= 0) return;
-#if defined(__AVX2__)
+#if defined(__AVX512F__)
+  constexpr int VW = 16, MR = 6, NV = 2, NR = VW * NV;
+#elif defined(__AVX2__)
   constexpr int VW = 8, MR = 4, NV = 2, NR = VW * NV;
 #elif defined(__ARM_NEON)
   constexpr int VW = 4, MR = 4, NV = 2, NR = VW * NV;
@@ -261,7 +287,32 @@ void gemm_dw(const float* dy, int dy_stride, const float* x, float* dW, int out,
         const int rb = t - cb * nrow;
         const int i0 = cb * NR;
         const int o0 = rb * MR;
-#if defined(__AVX2__)
+#if defined(__AVX512F__)
+        __m512 acc[MR][NV];
+        for (int m = 0; m < MR; ++m)
+          for (int v = 0; v < NV; ++v) acc[m][v] = _mm512_setzero_ps();
+        for (int k = 0; k < K; ++k) {
+          const float* wk = xb + static_cast<size_t>(k) * in + i0;
+          const float* dyk = dyb + static_cast<size_t>(k) * dy_stride;
+          __m512 wv[NV];
+          for (int v = 0; v < NV; ++v) wv[v] = _mm512_loadu_ps(wk + v * VW);
+          for (int m = 0; m < MR; ++m) {
+            const int o = o0 + m;
+            if (o >= out) break;
+            const __m512 g = _mm512_set1_ps(dyk[o]);
+            for (int v = 0; v < NV; ++v)
+              acc[m][v] = _mm512_fmadd_ps(g, wv[v], acc[m][v]);
+          }
+        }
+        for (int m = 0; m < MR; ++m) {
+          const int o = o0 + m;
+          if (o >= out) break;
+          for (int v = 0; v < NV; ++v) {
+            float* p = dW + static_cast<size_t>(o) * in + i0 + v * VW;
+            _mm512_storeu_ps(p, _mm512_add_ps(_mm512_loadu_ps(p), acc[m][v]));
+          }
+        }
+#elif defined(__AVX2__)
         __m256 acc[MR][NV];
         for (int m = 0; m < MR; ++m)
           for (int v = 0; v < NV; ++v) acc[m][v] = _mm256_setzero_ps();
