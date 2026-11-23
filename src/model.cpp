@@ -502,11 +502,30 @@ inline float silu_grad(float x) {
   const float s = 1.f / (1.f + std::exp(-x));
   return s + x * s * (1.f - s);
 }
+// Parallel: these call expf once per element over R*Hd values (~5.8M per layer),
+// so running them on a single thread left three cores idle while charging many
+// millions of transcendental calls (a large share of the step time).
 void silu_fwd(const float* x, float* y, int n) {
-  for (int i = 0; i < n; ++i) y[i] = silu(x[i]);
+  parallel_for(n, [&](int i0, int i1) {
+    for (int i = i0; i < i1; ++i) y[i] = silu(x[i]);
+  });
 }
 void silu_bwd(const float* x, const float* dy, float* dx, int n) {
-  for (int i = 0; i < n; ++i) dx[i] = dy[i] * silu_grad(x[i]);
+  parallel_for(n, [&](int i0, int i1) {
+    for (int i = i0; i < i1; ++i) dx[i] = dy[i] * silu_grad(x[i]);
+  });
+}
+// Elementwise helpers (memory-bound loops over millions of floats that used to
+// run on a single thread).
+inline void add_inplace(float* y, const float* x, int n) {
+  parallel_for(n, [&](int i0, int i1) {
+    for (int i = i0; i < i1; ++i) y[i] += x[i];
+  });
+}
+inline void mul_out(const float* a, const float* b, float* y, int n) {
+  parallel_for(n, [&](int i0, int i1) {
+    for (int i = i0; i < i1; ++i) y[i] = a[i] * b[i];
+  });
 }
 
 }  // namespace
@@ -763,7 +782,7 @@ void Model::forward(const int* toks, int B, int T) {
     rope_apply(A.k.data(), R, Tc);
     attn_forward(A, B, Tc);
     gemm_bcast(A.ctx.data(), w.to.data(), o_.data(), R, C, C);
-    for (size_t i = 0; i < static_cast<size_t>(R) * C; ++i) x_[i] += o_[i];
+    add_inplace(x_.data(), o_.data(), R * C);
 
     std::copy(x_.begin(), x_.begin() + static_cast<size_t>(R) * C, A.x1.begin());
     rmsnorm_fwd(x_.data(), w.ln2g->data.data(), A.a2.data(), A.ln2_rstd.data(), R, C,
@@ -771,9 +790,9 @@ void Model::forward(const int* toks, int B, int T) {
     gemm_bcast(A.a2.data(), w.t1.data(), A.h1.data(), R, C, Hd);
     silu_fwd(A.h1.data(), A.h2.data(), R * Hd);
     gemm_bcast(A.a2.data(), w.t3.data(), A.h3.data(), R, C, Hd);
-    for (size_t i = 0; i < static_cast<size_t>(R) * Hd; ++i) A.h4[i] = A.h2[i] * A.h3[i];
+    mul_out(A.h2.data(), A.h3.data(), A.h4.data(), R * Hd);
     gemm_bcast(A.h4.data(), w.t2.data(), o_.data(), R, Hd, C);
-    for (size_t i = 0; i < static_cast<size_t>(R) * C; ++i) x_[i] += o_[i];
+    add_inplace(x_.data(), o_.data(), R * C);
   }
 
   rmsnorm_fwd(x_.data(), lnfg_->data.data(), xf_.data(), rstdf_.data(), R, C,
@@ -1015,19 +1034,21 @@ void Model::backward(const int* toks) {
     // x_after = x1 + o(mlp)  =>  grad wrt mlp output = dx
     linear_bwd(A.h4.data(), w.W2->data.data(), dx, dh4, w.W2->grad.data(), R, Hd, C);
     // h4 = h2 * h3
-    for (size_t i = 0; i < rh; ++i) {
-      dh2[i] = dh4[i] * A.h3[i];
-      dh3[i] = dh4[i] * A.h2[i];
-    }
+    parallel_for(static_cast<int>(rh), [&](int i0, int i1) {
+      for (int i = i0; i < i1; ++i) {
+        dh2[i] = dh4[i] * A.h3[i];
+        dh3[i] = dh4[i] * A.h2[i];
+      }
+    });
     // h2 = silu(h1)
     silu_bwd(A.h1.data(), dh2, dh1, R * Hd);
     linear_bwd(A.a2.data(), w.W1->data.data(), dh1, da2, w.W1->grad.data(), R, C, Hd);
     // W3 contributes to the same a2 grad
     linear_bwd(A.a2.data(), w.W3->data.data(), dh3, da2b, w.W3->grad.data(), R, C, Hd);
-    for (size_t i = 0; i < rc; ++i) da2[i] += da2b[i];
+    add_inplace(da2, da2b, static_cast<int>(rc));
     rmsnorm_bwd(A.x1.data(), w.ln2g->data.data(), da2, tmp, w.ln2g->grad.data(),
                 A.ln2_rstd.data(), R, C);
-    for (size_t i = 0; i < rc; ++i) dx[i] += tmp[i];  // now grad wrt x1
+    add_inplace(dx, tmp, static_cast<int>(rc));  // now grad wrt x1
 
     // x1 = x0 + o(attn)
     linear_bwd(A.ctx.data(), w.Wo->data.data(), dx, dctx, w.Wo->grad.data(), R, C, C);
@@ -1038,10 +1059,12 @@ void Model::backward(const int* toks) {
     linear_bwd(A.a.data(), w.Wq->data.data(), dq, da_q, w.Wq->grad.data(), R, C, C);
     linear_bwd(A.a.data(), w.Wk->data.data(), dk, da_k, w.Wk->grad.data(), R, C, C);
     linear_bwd(A.a.data(), w.Wv->data.data(), dv, da_v, w.Wv->grad.data(), R, C, C);
-    for (size_t i = 0; i < rc; ++i) da[i] = da_q[i] + da_k[i] + da_v[i];
+    parallel_for(static_cast<int>(rc), [&](int i0, int i1) {
+      for (int i = i0; i < i1; ++i) da[i] = da_q[i] + da_k[i] + da_v[i];
+    });
     rmsnorm_bwd(A.xin.data(), w.ln1g->data.data(), da, dxin, w.ln1g->grad.data(),
                 A.ln1_rstd.data(), R, C);
-    for (size_t i = 0; i < rc; ++i) dx[i] += dxin[i];  // grad wrt block input
+    add_inplace(dx, dxin, static_cast<int>(rc));  // grad wrt block input
   }
 
   // token embedding grads
