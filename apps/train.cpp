@@ -174,9 +174,18 @@ int main(int argc, char** argv) {
     float lr = cfg.lr;
     if (step <= cfg.warmup)
       lr *= static_cast<float>(step) / cfg.warmup;
-    else if (cfg.max_steps <= 200000) {
-      float p = static_cast<float>(step - cfg.warmup) / (cfg.max_steps - cfg.warmup + 1);
-      p = std::min(1.f, p);
+    else {
+      float p = 0.f;
+      if (cfg.max_minutes > 0) {
+        // Anneal by wall-clock: whatever runner speed we draw, the cosine ends
+        // at ~lr 0 exactly when the time budget runs out.  A step-based schedule
+        // silently misses the endpoint on a slower runner, leaving the model
+        // un-annealed (the main cause of a worse final loss).
+        p = static_cast<float>((now_s() - t0) / budget);
+      } else if (cfg.max_steps <= 200000) {
+        p = static_cast<float>(step - cfg.warmup) / (cfg.max_steps - cfg.warmup + 1);
+      }
+      p = std::min(1.f, std::max(0.f, p));
       lr *= 0.5f * (1.f + std::cos(3.14159265f * p));
     }
     opt.set_lr(lr);
