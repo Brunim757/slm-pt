@@ -70,6 +70,9 @@ on:
       profile:
         description: "print per-phase step timing (1 = on)"
         default: "0"
+      require_avx512:
+        description: "fail fast unless the runner has AVX-512 (1 = yes)"
+        default: "0"
   # NOTE: the nightly `schedule` is intentionally disabled while KizuSmall's
   # corpus/tokenizer is still changing: auto-resuming with a different tokenizer
   # is refused on purpose (it would corrupt the weights). Re-enable it once the
@@ -85,6 +88,21 @@ jobs:
     timeout-minutes: 355
     steps:
       - uses: actions/checkout@v4
+
+      - name: Detect SIMD
+        run: |
+          FLAGS="$(grep -m1 '^flags' /proc/cpuinfo || true)"
+          if echo "$FLAGS" | grep -q avx512f; then
+            echo "SIMD: AVX-512"
+          elif echo "$FLAGS" | grep -q avx2; then
+            echo "SIMD: AVX2"
+            if [ "${{ github.event.inputs.require_avx512 }}" = "1" ]; then
+              echo "::error::runner has AVX2, not AVX-512; failing fast so the job can be re-scheduled"
+              exit 1
+            fi
+          else
+            echo "SIMD: scalar/other"
+          fi
 
       - name: Install toolchain
         run: |
