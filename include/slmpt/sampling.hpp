@@ -1,5 +1,6 @@
 #pragma once
 #include <string>
+#include <vector>
 
 #include "slmpt/model.hpp"
 #include "slmpt/rng.hpp"
@@ -14,6 +15,11 @@ struct SampleParams {
   float repetition_penalty = 1.15f;
   int repetition_window = 128;
   std::string stop = "<|end|>";
+  // Extra sequences that also end the reply (stripped from the output). The
+  // model is trained on multi-turn data, so after answering it may start a new
+  // turn ("<|user|>") instead of emitting "<|end|>"; stopping on any turn
+  // boundary keeps the reply to a single turn.
+  std::vector<std::string> stop_any;
   int max_new = 240;
 };
 

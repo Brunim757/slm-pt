@@ -74,6 +74,9 @@ int main(int argc, char** argv) {
   sp.repetition_penalty = rep;
   sp.max_new = max_new;
   sp.stop = "<|end|>";
+  // End the reply at the first turn boundary, so a model that keeps going after
+  // the answer (starting a new "<|user|>" turn) doesn't ramble on.
+  sp.stop_any = {"<|user|>", "<|system|>", "<|text|>", "<|assistant|>"};
 
   // Optional local retrieval (RAG): ground answers in your own files.
   RagIndex rag;

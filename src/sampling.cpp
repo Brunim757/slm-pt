@@ -89,12 +89,18 @@ std::string generate(Model& model, const BPETokenizer& tok, const std::string& p
     out.push_back(pick);
     all.push_back(pick);
 
-    // Stop when the decoded text ends with the stop sequence.
-    if (stop_len > 0) {
+    // Stop when the decoded text ends with the stop sequence (or any extra one).
+    if (stop_len > 0 || !sp.stop_any.empty()) {
       const std::string cur = tok.decode(out);
-      if (cur.size() >= sp.stop.size() &&
-          cur.compare(cur.size() - sp.stop.size(), sp.stop.size(), sp.stop) == 0) {
+      auto ends_with = [&](const std::string& s) {
+        return !s.empty() && cur.size() >= s.size() &&
+               cur.compare(cur.size() - s.size(), s.size(), s) == 0;
+      };
+      if (stop_len > 0 && ends_with(sp.stop)) {
         return cur.substr(0, cur.size() - sp.stop.size());
+      }
+      for (const std::string& s : sp.stop_any) {
+        if (ends_with(s)) return cur.substr(0, cur.size() - s.size());
       }
     }
 
