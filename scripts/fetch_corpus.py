@@ -73,12 +73,13 @@ def find_file(dataset, suffix, fallback):
     return fallback
 
 
-def find_shard(dataset, config):
-    """First train parquet inside a config subdir (e.g. `20231101.pt/`).
+def find_shards(dataset, config):
+    """All train parquet shards inside a config subdir (e.g. `20231101.pt/`).
 
     `find_file` cannot be used here: the multi-lingual dumps put every language
     in its own subdir, so a plain `.parquet` match could land on the wrong
-    language.  Configs are numbered; the shards are small enough to stream.
+    language.  Shards are numbered and streamed in order until the char budget
+    is met, so the whole Portuguese dump can be used when asked for.
     """
     try:
         with open_url(f"https://huggingface.co/api/datasets/{dataset}", timeout=60) as r:
@@ -88,11 +89,10 @@ def find_shard(dataset, config):
                 if f.startswith(config + "/") and f.endswith(".parquet")
                 and "train" in f.lower()]
         hits.sort()
-        if hits:
-            return hits[0]
+        return hits
     except Exception as exc:  # noqa: BLE001
         print(f"  (could not query {dataset}: {exc})", file=sys.stderr)
-    return ""
+    return []
 
 
 def download(url, path):
@@ -437,41 +437,48 @@ def main():
             #    budget is met, so we never decode the whole (~200 MB) shard in
             #    memory.  Documents are separated by a blank line.
             if args.wiki:
-                shard = find_shard(WIKI, args.wiki_config)
-                if not shard:
+                shards = find_shards(WIKI, args.wiki_config)
+                if not shards:
                     print("  (wiki skipped: no shard found)", file=sys.stderr)
                 else:
-                    url = f"https://huggingface.co/datasets/{WIKI}/resolve/main/{shard}"
+                    rows = []
+                    chars = 0
                     path = os.path.join(tmpdir, "wiki.parquet")
-                    print(f"downloading {shard} ...", file=sys.stderr)
-                    try:
-                        download(url, path)
-                        rows = []
-                        chars = 0
-                        for batch in pq.ParquetFile(path).iter_batches(
-                                batch_size=512, columns=["text"]):
-                            for tx in batch.column("text").to_pylist():
-                                tx = (tx or "").strip()
-                                if len(tx) < 200:      # skip stubs / list fragments
-                                    continue
-                                rows.append(tx)
-                                chars += len(tx)
-                                if args.wiki_limit and len(rows) >= args.wiki_limit:
+                    stop = False
+                    for shard in shards:
+                        if stop:
+                            break
+                        url = f"https://huggingface.co/datasets/{WIKI}/resolve/main/{shard}"
+                        print(f"downloading {shard} ...", file=sys.stderr)
+                        try:
+                            download(url, path)
+                            for batch in pq.ParquetFile(path).iter_batches(
+                                    batch_size=512, columns=["text"]):
+                                for tx in batch.column("text").to_pylist():
+                                    tx = (tx or "").strip()
+                                    if len(tx) < 200:  # skip stubs / list fragments
+                                        continue
+                                    rows.append(tx)
+                                    chars += len(tx)
+                                    if args.wiki_chars and chars >= args.wiki_chars:
+                                        stop = True
+                                        break
+                                    if args.wiki_limit and len(rows) >= args.wiki_limit:
+                                        stop = True
+                                        break
+                                if stop:
                                     break
-                            if args.wiki_limit and len(rows) >= args.wiki_limit:
-                                break
-                            if args.wiki_chars and chars >= args.wiki_chars:
-                                break
-                        random.shuffle(rows)
-                        for tx in rows:
-                            f.write("<|text|>\n")
-                            f.write(tx)
-                            f.write("\n<|end|>\n")
-                            written += 1
-                            n_wiki += 1
-                            raw_chars += len(tx)
-                    except Exception as exc:  # noqa: BLE001
-                        print(f"  (wiki skipped: {exc})", file=sys.stderr)
+                            os.remove(path)
+                        except Exception as exc:  # noqa: BLE001
+                            print(f"  (wiki shard skipped: {exc})", file=sys.stderr)
+                    random.shuffle(rows)
+                    for tx in rows:
+                        f.write("<|text|>\n")
+                        f.write(tx)
+                        f.write("\n<|end|>\n")
+                        written += 1
+                        n_wiki += 1
+                        raw_chars += len(tx)
                 print(f"  wiki: {n_wiki} articles ({raw_chars / 1048576:.1f} MB raw)",
                       file=sys.stderr)
 

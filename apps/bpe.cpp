@@ -52,6 +52,19 @@ int main(int argc, char** argv) {
     return 1;
   }
 
+  // --load <tok>: reuse an existing tokenizer and only (re)encode the corpus.
+  // This keeps the vocabulary byte-for-byte identical when the corpus grows, so
+  // a checkpoint can keep training on more data without a tokenizer mismatch.
+  const std::string load_tok = argval(argc, argv, "--load", "");
+  BPETokenizer tok;
+  if (!load_tok.empty()) {
+    if (!tok.load(load_tok)) {
+      std::fprintf(stderr, "cannot load tokenizer %s\n", load_tok.c_str());
+      return 1;
+    }
+    std::fprintf(stderr, "loaded tokenizer %s (vocab %d, %d merges)\n",
+                 load_tok.c_str(), tok.vocab_size(), tok.n_merges());
+  } else {
   // 1) word frequencies.  Reserved control tokens are stripped first so that no
   //    merge is ever learned inside them — they must stay atomic.
   const std::vector<std::string>& specials = BPETokenizer::default_specials();
@@ -147,9 +160,9 @@ int main(int argc, char** argv) {
     }
   }
 
-  BPETokenizer tok;
   tok.set_merges(merges);
   tok.set_specials(BPETokenizer::default_specials());
+  }  // end of training branch (skipped when --load is used)
   if (!tok.save(out)) {
     std::fprintf(stderr, "cannot write %s\n", out.c_str());
     return 1;

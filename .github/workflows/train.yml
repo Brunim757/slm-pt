@@ -39,8 +39,8 @@ on:
         description: "include Wikipedia raw prose (0/1)"
         default: "1"
       wiki_chars:
-        description: "max raw-text characters (0 = whole shard)"
-        default: "40000000"
+        description: "max raw-text characters (0 = whole dump)"
+        default: "1500000000"
       bpe_vocab:
         description: "BPE vocabulary size"
         default: "2048"
@@ -126,28 +126,12 @@ jobs:
             --chat-weight "${{ github.event.inputs.chat_weight || '12' }}" \
             --oasst-weight "${{ github.event.inputs.oasst_weight || '2' }}" \
             --wiki "${{ github.event.inputs.wiki || '1' }}" \
-            --wiki-chars "${{ github.event.inputs.wiki_chars || '40000000' }}"
+            --wiki-chars "${{ github.event.inputs.wiki_chars || '1500000000' }}"
 
       - name: Build
         run: |
           cmake -B build -DCMAKE_BUILD_TYPE=Release
           cmake --build build -j"$(nproc)"
-
-      - name: Train BPE tokenizer
-        run: |
-          ./build/slmpt_bpe --in data/corpus.txt --out data/tokenizer.txt \
-            --ids data/corpus.ids --vocab "${{ github.event.inputs.bpe_vocab || '2048' }}"
-
-      - name: Gradient check
-        run: ./build/slmpt_gradcheck
-
-      - name: Smoke test (fast)
-        run: |
-          mkdir -p runs/smoke
-          ./build/slmpt_train --data data/corpus.txt --ids data/corpus.ids \
-            --tokenizer data/tokenizer.txt --out runs/smoke \
-            --embd 64 --layer 2 --head 4 --block 64 --batch 8 \
-            --steps 20 --save-every 20 --sample-every 20 --threads 4
 
       - name: Resume previous checkpoint (optional)
         env:
@@ -167,7 +151,33 @@ jobs:
               gh run download "$RESUME_RUN" -D /tmp/prev || true
             PREV="$(find /tmp/prev -name model.bin -print -quit)"
             if [ -n "$PREV" ]; then cp "$PREV" runs/model.bin; echo "resumed model -> runs/model.bin"; fi
+            PREVTOK="$(find /tmp/prev -name tokenizer.txt -print -quit)"
+            if [ -n "$PREVTOK" ]; then cp "$PREVTOK" data/tokenizer.base.txt; echo "frozen tokenizer -> data/tokenizer.base.txt"; fi
           fi
+
+      - name: Build tokenizer + corpus ids
+        run: |
+          if [ -f data/tokenizer.base.txt ]; then
+            # Resume: freeze the vocabulary so a growing corpus can never change
+            # the token ids (the checkpoint embeds this exact tokenizer).
+            ./build/slmpt_bpe --load data/tokenizer.base.txt \
+              --in data/corpus.txt --out data/tokenizer.txt --ids data/corpus.ids
+            cp data/tokenizer.base.txt data/tokenizer.txt
+          else
+            ./build/slmpt_bpe --in data/corpus.txt --out data/tokenizer.txt \
+              --ids data/corpus.ids --vocab "${{ github.event.inputs.bpe_vocab || '2048' }}"
+          fi
+
+      - name: Gradient check
+        run: ./build/slmpt_gradcheck
+
+      - name: Smoke test (fast)
+        run: |
+          mkdir -p runs/smoke
+          ./build/slmpt_train --data data/corpus.txt --ids data/corpus.ids \
+            --tokenizer data/tokenizer.txt --out runs/smoke \
+            --embd 64 --layer 2 --head 4 --block 64 --batch 8 \
+            --steps 20 --save-every 20 --sample-every 20 --threads 4
 
       - name: Train
         env:
