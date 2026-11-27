@@ -112,22 +112,27 @@ def list_parquet(dataset):
     return []
 
 
-def download(url, path, timeout=600):
-    """Download with a hard timeout + retries (falls back to urllib).
+def download(url, path, timeout=300):
+    """Download a file with a hard timeout, stall detection and retries.
 
     urllib has no whole-transfer timeout, so a stalled connection can hang the
-    job forever; curl's --max-time bounds it.
+    job forever.  curl bounds the total time (--max-time) *and* aborts a
+    connection that drops below --speed-limit for --speed-time seconds, so a
+    dead mirror is abandoned in ~30 s instead of 10 min.  curl is curl-only: on
+    failure we raise and the caller skips that shard rather than falling back to
+    an unbounded urllib copy.
     """
-    try:
-        import subprocess
+    import subprocess
+    if shutil.which("curl"):
         subprocess.run(
-            ["curl", "-sSL", "--fail", "--max-time", str(timeout),
-             "--retry", "3", "--retry-delay", "2", "-o", path, url],
+            ["curl", "-sSL", "--fail", "--connect-timeout", "15",
+             "--speed-limit", "100000", "--speed-time", "30",
+             "--max-time", str(timeout), "--retry", "3", "--retry-delay", "2",
+             "--retry-all-errors", "-o", path, url],
             check=True, timeout=timeout + 60)
         return
-    except Exception:  # noqa: BLE001
-        with open_url(url, timeout=timeout) as r, open(path, "wb") as f:
-            shutil.copyfileobj(r, f, length=1 << 20)
+    with open_url(url, timeout=timeout) as r, open(path, "wb") as f:
+        shutil.copyfileobj(r, f, length=1 << 20)
 
 
 def fmt(instr, inp, out):
@@ -331,12 +336,12 @@ def main():
     ap.add_argument("--oasst", type=int, default=1, help="include oasst1 pt pairs (0/1)")
     ap.add_argument("--oasst-max", type=int, default=8000, help="max oasst pairs")
     ap.add_argument("--aira", type=int, default=1, help="include Aira pt instructions (0/1)")
-    ap.add_argument("--aira-limit", type=int, default=80000, help="max Aira pairs")
+    ap.add_argument("--aira-limit", type=int, default=50000, help="max Aira pairs")
     ap.add_argument("--aira-max-chars", type=int, default=2000,
                     help="skip Aira answers longer than this (0 = keep all)")
     ap.add_argument("--ptbr11m", type=int, default=1,
                     help="include Instruct-PTBR-ENUS-11M (0/1)")
-    ap.add_argument("--ptbr11m-limit", type=int, default=200000, help="max 11M pt pairs")
+    ap.add_argument("--ptbr11m-limit", type=int, default=100000, help="max 11M pt pairs")
     ap.add_argument("--ptbr11m-max-chars", type=int, default=1200,
                     help="skip 11M answers longer than this (0 = keep all)")
     ap.add_argument("--pcdt", type=int, default=1, help="include PCDT domain QA (0/1)")
