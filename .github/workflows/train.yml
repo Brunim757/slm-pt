@@ -40,7 +40,7 @@ on:
         default: "1"
       wiki_chars:
         description: "max raw-text characters (0 = whole dump)"
-        default: "800000000"
+        default: "1500000000"
       bpe_vocab:
         description: "BPE vocabulary size"
         default: "2048"
@@ -122,7 +122,7 @@ jobs:
             --chat-weight "${{ github.event.inputs.chat_weight || '12' }}" \
             --oasst-weight "${{ github.event.inputs.oasst_weight || '2' }}" \
             --wiki "${{ github.event.inputs.wiki || '1' }}" \
-            --wiki-chars "${{ github.event.inputs.wiki_chars || '800000000' }}"
+            --wiki-chars "${{ github.event.inputs.wiki_chars || '1500000000' }}"
 
       - name: Build
         run: |
