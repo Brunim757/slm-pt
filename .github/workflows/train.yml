@@ -1,15 +1,19 @@
 # Long training job (runs on GitHub-hosted runners).
-# Public repo => unlimited Actions minutes, so training can be chained across
-# runs: pass `resume_run=<previous run id>`, or `chain=1` to auto-resume from
-# the latest successful run (used by the nightly schedule).
+# One single model, trained forever: every run resumes the latest successful
+# checkpoint (never from scratch), so the weights keep improving over time.
+# A run can also resume a specific run with `resume_run=<id>`.
 name: train
 
 on:
+  schedule:
+    # continuous training of the single KizuSmall model: every 6h a new run
+    # resumes the latest successful checkpoint (never from scratch).
+    - cron: '0 */6 * * *'
   workflow_dispatch:
     inputs:
       steps:
-        description: "max training steps (5h fits ~3000 for KizuSmall)"
-        default: "3000"
+        description: "max training steps (5h fits ~40000 for KizuSmall)"
+        default: "100000"
       max_minutes:
         description: "wall-clock budget (minutes)"
         default: "300"
@@ -39,19 +43,19 @@ on:
         default: "40000000"
       bpe_vocab:
         description: "BPE vocabulary size"
-        default: "4096"
+        default: "2048"
       embd:
         description: "embedding dim"
-        default: "256"
+        default: "192"
       layer:
         description: "number of layers"
-        default: "6"
+        default: "5"
       head:
         description: "attention heads"
-        default: "8"
+        default: "6"
       block:
         description: "context length"
-        default: "256"
+        default: "192"
       batch:
         description: "batch size"
         default: "32"
@@ -73,14 +77,14 @@ on:
       require_avx512:
         description: "fail fast unless the runner has AVX-512 (1 = yes)"
         default: "0"
-  # NOTE: the nightly `schedule` is intentionally disabled while KizuSmall's
-  # corpus/tokenizer is still changing: auto-resuming with a different tokenizer
-  # is refused on purpose (it would corrupt the weights). Re-enable it once the
-  # tokenizer is frozen.
 
 permissions:
   contents: read
   actions: read
+
+concurrency:
+  group: train
+  cancel-in-progress: false
 
 jobs:
   train:
@@ -132,7 +136,7 @@ jobs:
       - name: Train BPE tokenizer
         run: |
           ./build/slmpt_bpe --in data/corpus.txt --out data/tokenizer.txt \
-            --ids data/corpus.ids --vocab "${{ github.event.inputs.bpe_vocab || '4096' }}"
+            --ids data/corpus.ids --vocab "${{ github.event.inputs.bpe_vocab || '2048' }}"
 
       - name: Gradient check
         run: ./build/slmpt_gradcheck
@@ -174,13 +178,13 @@ jobs:
           if [ -f runs/model.bin ]; then RESUME="--resume runs/model.bin"; fi
           ./build/slmpt_train --data data/corpus.txt --ids data/corpus.ids \
             --tokenizer data/tokenizer.txt --out runs \
-            --embd ${{ github.event.inputs.embd || '256' }} \
-            --layer ${{ github.event.inputs.layer || '6' }} \
-            --head ${{ github.event.inputs.head || '8' }} \
-            --block ${{ github.event.inputs.block || '256' }} \
+            --embd ${{ github.event.inputs.embd || '192' }} \
+            --layer ${{ github.event.inputs.layer || '5' }} \
+            --head ${{ github.event.inputs.head || '6' }} \
+            --block ${{ github.event.inputs.block || '192' }} \
             --batch ${{ github.event.inputs.batch || '32' }} \
             --lr ${{ github.event.inputs.lr || '4e-4' }} \
-            --steps ${{ github.event.inputs.steps || '3000' }} \
+            --steps ${{ github.event.inputs.steps || '100000' }} \
             --max-minutes ${{ github.event.inputs.max_minutes || '300' }} \
             --save-every 500 --sample-every 500 --threads "$(nproc)" $RESUME
 
