@@ -617,8 +617,12 @@ void Model::init_params() {
   for (int l = 0; l < L_; ++l) {
     std::fill(layers_[l].ln1g->data.begin(), layers_[l].ln1g->data.end(), 1.f);
     std::fill(layers_[l].ln2g->data.begin(), layers_[l].ln2g->data.end(), 1.f);
+    // Norm gains are excluded from weight decay (1D params).
+    layers_[l].ln1g->decay = false;
+    layers_[l].ln2g->decay = false;
   }
   std::fill(lnfg_->data.begin(), lnfg_->data.end(), 1.f);
+  lnfg_->decay = false;
 }
 
 void Model::sync_transposed() {

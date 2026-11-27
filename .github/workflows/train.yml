@@ -12,26 +12,26 @@ on:
   workflow_dispatch:
     inputs:
       steps:
-        description: "max training steps (5h fits ~40000 for KizuSmall)"
+        description: "max training steps per run (loop also stops on time)"
         default: "100000"
       max_minutes:
         description: "wall-clock budget (minutes)"
-        default: "300"
+        default: "330"
       examples:
         description: "alpaca pairs limit (0 = all)"
-        default: "8000"
+        default: "20000"
       alpaca_max_chars:
         description: "skip alpaca answers longer than this (0 = keep all)"
         default: "600"
       canarim_limit:
         description: "Canarim instruction pairs limit (0 = all)"
-        default: "30000"
+        default: "100000"
       canarim_max_chars:
         description: "skip Canarim answers longer than this (0 = keep all)"
         default: "800"
       chat_weight:
         description: "repeat factor for generated chat"
-        default: "12"
+        default: "4"
       oasst_weight:
         description: "repeat factor for oasst pairs"
         default: "2"
@@ -43,25 +43,25 @@ on:
         default: "1500000000"
       bpe_vocab:
         description: "BPE vocabulary size"
-        default: "2048"
+        default: "8192"
       embd:
         description: "embedding dim"
-        default: "192"
+        default: "448"
       layer:
         description: "number of layers"
-        default: "5"
+        default: "11"
       head:
         description: "attention heads"
-        default: "6"
+        default: "7"
       block:
         description: "context length"
-        default: "192"
+        default: "512"
       batch:
         description: "batch size"
         default: "32"
       lr:
         description: "learning rate"
-        default: "4e-4"
+        default: "6e-4"
       resume_run:
         description: "run id to resume from (empty = fresh)"
         default: ""
@@ -71,6 +71,9 @@ on:
       quant_bits:
         description: "quantization bits for the report (8/4/2)"
         default: "4"
+      quantize:
+        description: "run the int4 compression report (1 = yes; 0 = skip on train runs)"
+        default: "0"
       profile:
         description: "print per-phase step timing (1 = on)"
         default: "0"
@@ -119,20 +122,21 @@ jobs:
           path: data/corpus.txt
           # Deterministic corpus: same script + same knobs -> same text, so it is
           # safe to reuse across runs (the token ids are still re-encoded below).
-          key: slmpt-corpus-${{ hashFiles('scripts/fetch_corpus.py') }}-${{ github.event.inputs.wiki || '1' }}-${{ github.event.inputs.wiki_chars || '1500000000' }}-${{ github.event.inputs.examples || '8000' }}-${{ github.event.inputs.alpaca_max_chars || '600' }}-${{ github.event.inputs.canarim_limit || '30000' }}-${{ github.event.inputs.canarim_max_chars || '800' }}-${{ github.event.inputs.chat_weight || '12' }}-${{ github.event.inputs.oasst_weight || '2' }}
+          key: slmpt-corpus-${{ hashFiles('scripts/fetch_corpus.py') }}-${{ github.event.inputs.wiki || '1' }}-${{ github.event.inputs.wiki_chars || '1500000000' }}-${{ github.event.inputs.examples || '20000' }}-${{ github.event.inputs.alpaca_max_chars || '600' }}-${{ github.event.inputs.canarim_limit || '100000' }}-${{ github.event.inputs.canarim_max_chars || '800' }}-${{ github.event.inputs.chat_weight || '4' }}-${{ github.event.inputs.oasst_weight || '2' }}
 
       - name: Fetch Portuguese corpus
         if: steps.corpus_cache.outputs.cache-hit != 'true'
         run: |
           python3 scripts/fetch_corpus.py --out data/corpus.txt \
-            --limit "${{ github.event.inputs.examples || '8000' }}" \
+            --limit "${{ github.event.inputs.examples || '20000' }}" \
             --alpaca-max-chars "${{ github.event.inputs.alpaca_max_chars || '600' }}" \
-            --canarim-limit "${{ github.event.inputs.canarim_limit || '30000' }}" \
+            --canarim-limit "${{ github.event.inputs.canarim_limit || '100000' }}" \
             --canarim-max-chars "${{ github.event.inputs.canarim_max_chars || '800' }}" \
-            --chat-weight "${{ github.event.inputs.chat_weight || '12' }}" \
+            --chat-weight "${{ github.event.inputs.chat_weight || '4' }}" \
             --oasst-weight "${{ github.event.inputs.oasst_weight || '2' }}" \
             --wiki "${{ github.event.inputs.wiki || '1' }}" \
-            --wiki-chars "${{ github.event.inputs.wiki_chars || '1500000000' }}"
+            --wiki-chars "${{ github.event.inputs.wiki_chars || '1500000000' }}" \
+            --prose-ratio 3.0
 
       - name: Note corpus reuse
         if: steps.corpus_cache.outputs.cache-hit == 'true'
@@ -154,15 +158,24 @@ jobs:
           fi
           mkdir -p runs
           if [ -n "$RESUME_RUN" ]; then
-            echo "resuming from run $RESUME_RUN"
+            echo "candidate resume run: $RESUME_RUN"
             rm -rf /tmp/prev && mkdir -p /tmp/prev
             gh run download "$RESUME_RUN" --name kizu-small-run -D /tmp/prev || \
               gh run download "$RESUME_RUN" --name slm-pt-run -D /tmp/prev || \
               gh run download "$RESUME_RUN" -D /tmp/prev || true
-            PREV="$(find /tmp/prev -name model.bin -print -quit)"
-            if [ -n "$PREV" ]; then cp "$PREV" runs/model.bin; echo "resumed model -> runs/model.bin"; fi
-            PREVTOK="$(find /tmp/prev -name tokenizer.txt -print -quit)"
-            if [ -n "$PREVTOK" ]; then cp "$PREVTOK" data/tokenizer.base.txt; echo "frozen tokenizer -> data/tokenizer.base.txt"; fi
+            # Only resume a checkpoint whose architecture matches the configured
+            # one. A different n_embd/vocab would silently fail to load, and worse,
+            # its frozen tokenizer would be copied and used to train the new model.
+            WANT="embd=${{ github.event.inputs.embd || '448' }} layer=${{ github.event.inputs.layer || '11' }} head=${{ github.event.inputs.head || '7' }} block=${{ github.event.inputs.block || '512' }} vocab=${{ github.event.inputs.bpe_vocab || '8192' }}"
+            PREV_ARCH="$(find /tmp/prev -name arch.txt -print -quit | xargs -r cat 2>/dev/null | tr -d '\n' || true)"
+            if [ "$PREV_ARCH" = "$WANT" ]; then
+              PREV="$(find /tmp/prev -name model.bin -print -quit)"
+              if [ -n "$PREV" ]; then cp "$PREV" runs/model.bin; echo "resumed model -> runs/model.bin"; fi
+              PREVTOK="$(find /tmp/prev -name tokenizer.txt -print -quit)"
+              if [ -n "$PREVTOK" ]; then cp "$PREVTOK" data/tokenizer.base.txt; echo "frozen tokenizer -> data/tokenizer.base.txt"; fi
+            else
+              echo "arch mismatch (prev='$PREV_ARCH' want='$WANT') -> fresh start, not resuming"
+            fi
           fi
 
       - name: Build tokenizer + corpus ids
@@ -175,7 +188,7 @@ jobs:
             cp data/tokenizer.base.txt data/tokenizer.txt
           else
             ./build/slmpt_bpe --in data/corpus.txt --out data/tokenizer.txt \
-              --ids data/corpus.ids --vocab "${{ github.event.inputs.bpe_vocab || '2048' }}"
+              --ids data/corpus.ids --vocab "${{ github.event.inputs.bpe_vocab || '8192' }}"
           fi
 
       - name: Gradient check
@@ -198,26 +211,29 @@ jobs:
           if [ -f runs/model.bin ]; then RESUME="--resume runs/model.bin"; fi
           ./build/slmpt_train --data data/corpus.txt --ids data/corpus.ids \
             --tokenizer data/tokenizer.txt --out runs \
-            --embd ${{ github.event.inputs.embd || '192' }} \
-            --layer ${{ github.event.inputs.layer || '5' }} \
-            --head ${{ github.event.inputs.head || '6' }} \
-            --block ${{ github.event.inputs.block || '192' }} \
+            --embd ${{ github.event.inputs.embd || '448' }} \
+            --layer ${{ github.event.inputs.layer || '11' }} \
+            --head ${{ github.event.inputs.head || '7' }} \
+            --block ${{ github.event.inputs.block || '512' }} \
             --batch ${{ github.event.inputs.batch || '32' }} \
-            --lr ${{ github.event.inputs.lr || '4e-4' }} \
+            --lr ${{ github.event.inputs.lr || '6e-4' }} \
             --steps ${{ github.event.inputs.steps || '100000' }} \
-            --max-minutes ${{ github.event.inputs.max_minutes || '300' }} \
+            --max-minutes ${{ github.event.inputs.max_minutes || '330' }} \
             --save-every 500 --sample-every 500 --threads "$(nproc)" $RESUME
 
       - name: Evaluate (held-out perplexity)
         run: |
           ./build/slmpt_eval --model runs/model.bin --ids data/corpus.ids \
-            --data data/corpus.txt --val 0.02 --threads "$(nproc)" | tee runs/eval.txt
+            --data data/corpus.txt --val 0.01 --max-tokens 200000 \
+            --threads "$(nproc)" | tee runs/eval.txt
 
       - name: Compression report
+        if: ${{ github.event.inputs.quantize == '1' }}
         run: |
           ./build/slmpt_quantize --model runs/model.bin --ids data/corpus.ids \
             --data data/corpus.txt --bits ${{ github.event.inputs.quant_bits || '4' }} \
-            --group 64 --out runs/model_q.bin --val 0.02 --threads "$(nproc)"
+            --group 64 --out runs/model_q.bin --val 0.01 --max-tokens 200000 \
+            --threads "$(nproc)"
 
       - name: Upload checkpoint + reports
         uses: actions/upload-artifact@v4
@@ -228,5 +244,6 @@ jobs:
             runs/model_q.bin
             runs/samples.txt
             runs/eval.txt
+            runs/arch.txt
             data/tokenizer.txt
           if-no-files-found: warn

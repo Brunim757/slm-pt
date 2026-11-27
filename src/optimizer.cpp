@@ -28,7 +28,8 @@ void AdamW::step(std::vector<Param*>& params, int step) {
       const float mh = p->m[i] / bc1;
       const float vh = p->v[i] / bc2;
       const float upd = mh / (std::sqrt(vh) + eps_);
-      p->data[i] -= lr_ * (upd + wd_ * p->data[i]);
+      const float wd = p->decay ? wd_ * p->data[i] : 0.f;
+      p->data[i] -= lr_ * (upd + wd);
     }
   }
 }

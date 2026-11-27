@@ -28,6 +28,7 @@ int main(int argc, char** argv) {
   const std::string ids = argval(argc, argv, "--ids", "data/corpus.ids");
   const std::string data = argval(argc, argv, "--data", "data/corpus.txt");
   const double val_frac = std::atof(argval(argc, argv, "--val", "0.05"));
+  const long max_toks = std::atol(argval(argc, argv, "--max-tokens", "0"));
   const int threads = std::atoi(argval(argc, argv, "--threads", "0"));
   if (threads > 0) set_threads(threads);
 
@@ -56,14 +57,21 @@ int main(int argc, char** argv) {
   }
   const size_t n = ds.size();
   const size_t val_start = n - static_cast<size_t>(n * val_frac);
+  // Cap the validation to a fixed token budget so a big model does not spend
+  // hours computing a perplexity that a few hundred thousand tokens already pin
+  // down (the estimate is stable long before 2% of a large corpus).
+  size_t val_end = n;
+  if (max_toks > 0 && val_start + static_cast<size_t>(max_toks) < val_end)
+    val_end = val_start + static_cast<size_t>(max_toks);
   double mean_loss = 0.0;
-  const double ppl = eval_perplexity(model, ds, val_start, n, cfg.block, cfg.block,
+  const double ppl = eval_perplexity(model, ds, val_start, val_end, cfg.block, cfg.block,
                                      &mean_loss);
   std::printf("model: %s (vocab %d, block %d, params", path.c_str(), cfg.vocab, cfg.block);
   long params = 0;
   for (Param* p : model.params()) params += (long)p->size();
   std::printf(" %.2fM)\n", params / 1e6);
-  std::printf("val tokens: %zu (last %.1f%%)\n", n - val_start, val_frac * 100.0);
+  std::printf("val tokens: %zu (last %.1f%% capped at %ld)\n", val_end - val_start,
+              val_frac * 100.0, max_toks);
   std::printf("loss: %.4f   perplexity: %.2f\n", mean_loss, ppl);
   return 0;
 }

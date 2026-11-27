@@ -113,6 +113,19 @@ int main(int argc, char** argv) {
   std::printf("simd: scalar   gemm: tiled broadcast\n");
 #endif
 
+  // Architecture fingerprint. The workflow compares it against the previous
+  // run's and refuses to resume a checkpoint whose shape/vocab differs (the
+  // tokenizer must match byte-for-byte, and a different n_embd would silently
+  // fail to load). Written next to the checkpoint so it travels in the artifact.
+  {
+    FILE* af = std::fopen((cfg.out_dir + "/arch.txt").c_str(), "w");
+    if (af) {
+      std::fprintf(af, "embd=%d layer=%d head=%d block=%d vocab=%d\n", cfg.n_embd,
+                   cfg.n_layer, cfg.n_head, cfg.block, cfg.vocab);
+      std::fclose(af);
+    }
+  }
+
   long base_step = 0;
   if (!cfg.resume.empty()) {
     // Safety lock: a resume is only valid if the tokenizer used to build the

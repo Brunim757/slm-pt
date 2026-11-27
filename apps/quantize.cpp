@@ -33,6 +33,7 @@ int main(int argc, char** argv) {
   const int bits = std::atoi(argval(argc, argv, "--bits", "4"));
   const int group = std::atoi(argval(argc, argv, "--group", "64"));
   const double val_frac = std::atof(argval(argc, argv, "--val", "0.02"));
+  const long max_toks = std::atol(argval(argc, argv, "--max-tokens", "0"));
   const int threads = std::atoi(argval(argc, argv, "--threads", "0"));
   if (threads > 0) set_threads(threads);
 
@@ -61,9 +62,12 @@ int main(int argc, char** argv) {
   }
   const size_t n = ds.size();
   const size_t val_start = n - static_cast<size_t>(n * val_frac);
+  size_t val_end = n;
+  if (max_toks > 0 && val_start + static_cast<size_t>(max_toks) < val_end)
+    val_end = val_start + static_cast<size_t>(max_toks);
 
   double loss0 = 0.0;
-  const double ppl0 = eval_perplexity(model, ds, val_start, n, cfg.block, cfg.block,
+  const double ppl0 = eval_perplexity(model, ds, val_start, val_end, cfg.block, cfg.block,
                                       &loss0);
 
   QuantStats st;
@@ -79,7 +83,7 @@ int main(int argc, char** argv) {
     return 1;
   }
   double loss1 = 0.0;
-  const double ppl1 = eval_perplexity(qmodel, ds, val_start, n, cfg.block, cfg.block,
+  const double ppl1 = eval_perplexity(qmodel, ds, val_start, val_end, cfg.block, cfg.block,
                                       &loss1);
 
   std::printf("== quantization report ==\n");

@@ -39,6 +39,9 @@ OASST = "OpenAssistant/oasst1"
 OASST_FALLBACK = "data/train-00000-of-00001-b42a775f407cee45.parquet"
 WIKI = "wikimedia/wikipedia"
 WIKI_CONFIG = "20231101.pt"  # Portuguese dump; shards live under this subdir
+AIRA = "nicholasKluge/instruct-aira-dataset"   # curated Portuguese instructions
+PTBR11M = "cnmoro/Instruct-PTBR-ENUS-11M"      # large PT/EN instruction pool
+PCDTQA = "hugo/pcdt-qa"                        # real pt-BR domain QA (health/legal)
 PT_LANGS = {"pt", "pt-BR", "pt_PT", "pt-br"}
 
 # Identity: a fixed system message prepended to every chat block.  It teaches the
@@ -90,6 +93,20 @@ def find_shards(dataset, config):
                 and "train" in f.lower()]
         hits.sort()
         return hits
+    except Exception as exc:  # noqa: BLE001
+        print(f"  (could not query {dataset}: {exc})", file=sys.stderr)
+    return []
+
+
+def list_parquet(dataset):
+    """All parquet files of a dataset (root or nested), sorted by name."""
+    try:
+        with open_url(f"https://huggingface.co/api/datasets/{dataset}", timeout=60) as r:
+            info = json.load(r)
+        files = [s["rfilename"] for s in info.get("siblings", [])
+                 if s["rfilename"].endswith(".parquet")]
+        files.sort()
+        return files
     except Exception as exc:  # noqa: BLE001
         print(f"  (could not query {dataset}: {exc})", file=sys.stderr)
     return []
@@ -313,6 +330,21 @@ def main():
     ap.add_argument("--oasst-weight", type=int, default=2, help="repeat oasst pairs")
     ap.add_argument("--oasst", type=int, default=1, help="include oasst1 pt pairs (0/1)")
     ap.add_argument("--oasst-max", type=int, default=8000, help="max oasst pairs")
+    ap.add_argument("--aira", type=int, default=1, help="include Aira pt instructions (0/1)")
+    ap.add_argument("--aira-limit", type=int, default=80000, help="max Aira pairs")
+    ap.add_argument("--aira-max-chars", type=int, default=2000,
+                    help="skip Aira answers longer than this (0 = keep all)")
+    ap.add_argument("--ptbr11m", type=int, default=1,
+                    help="include Instruct-PTBR-ENUS-11M (0/1)")
+    ap.add_argument("--ptbr11m-limit", type=int, default=200000, help="max 11M pt pairs")
+    ap.add_argument("--ptbr11m-max-chars", type=int, default=1200,
+                    help="skip 11M answers longer than this (0 = keep all)")
+    ap.add_argument("--pcdt", type=int, default=1, help="include PCDT domain QA (0/1)")
+    ap.add_argument("--pcdt-limit", type=int, default=10000, help="max PCDT QA pairs")
+    ap.add_argument("--instr-weight", type=int, default=1,
+                    help="repeat factor for downloaded instruction/QA sources "
+                         "(the prose budget scales with them, so 1 keeps the "
+                         "mix balanced without memorizing repeats)")
     ap.add_argument("--wiki", type=int, default=1,
                     help="include Wikipedia raw prose (0/1)")
     ap.add_argument("--wiki-config", default=WIKI_CONFIG,
@@ -320,7 +352,11 @@ def main():
     ap.add_argument("--wiki-limit", type=int, default=0,
                     help="max wiki articles (0 = as many as fit the char budget)")
     ap.add_argument("--wiki-chars", type=int, default=40000000,
-                    help="max raw-text characters (0 = entire shard)")
+                    help="hard cap on raw-text characters (0 = entire shard)")
+    ap.add_argument("--prose-ratio", type=float, default=3.0,
+                    help="prose budget = ratio x instruction bytes, so the mix "
+                         "stays balanced no matter how big each source is "
+                         "(0 = use --wiki-chars verbatim). 3.0 -> ~75%% prose")
     ap.add_argument("--no-net", type=int, default=0, help="skip downloads (chat only)")
     ap.add_argument("--seed", type=int, default=1234)
     args = ap.parse_args()
@@ -333,6 +369,7 @@ def main():
     chat = gen_smalltalk()
     written = 0
     n_st = n_alp = n_oas = n_can = n_wiki = 0
+    n_aira = n_11m = n_pcdt = 0
     raw_chars = 0
     tmpdir = tempfile.mkdtemp()
     with open(args.out, "w", encoding="utf-8") as f:
@@ -445,10 +482,135 @@ def main():
                     print(f"  (oasst skipped: {exc})", file=sys.stderr)
             print(f"  oasst(pt): {n_oas} pairs", file=sys.stderr)
 
+            # 3b) Aira — curated Portuguese instruction/answer pairs (real data,
+            #     downloaded, not generated).  Broad topics, clean answers.
+            if args.aira:
+                files = list_parquet(AIRA)
+                f_pt = next((x for x in files if "portuguese" in x.lower()), None)
+                if not f_pt:
+                    print("  (aira skipped: no portuguese parquet)", file=sys.stderr)
+                else:
+                    url = f"https://huggingface.co/datasets/{AIRA}/resolve/main/{f_pt}"
+                    path = os.path.join(tmpdir, "aira.parquet")
+                    print(f"downloading {f_pt} ...", file=sys.stderr)
+                    try:
+                        download(url, path)
+                        t = pq.read_table(path, columns=["prompt", "completion"]).to_pydict()
+                        n = len(t["prompt"])
+                        lim = args.aira_limit if args.aira_limit > 0 else n
+                        rows = []
+                        for i in range(min(lim, n)):
+                            q = (t["prompt"][i] or "").strip()
+                            a = (t["completion"][i] or "").strip()
+                            if not q or not a:
+                                continue
+                            if args.aira_max_chars > 0 and len(a) > args.aira_max_chars:
+                                continue
+                            rows.append(fmt(q, "", a))
+                        for _ in range(max(1, args.instr_weight)):
+                            random.shuffle(rows)
+                            for ex in rows:
+                                f.write(ex)
+                                written += 1
+                                n_aira += 1
+                    except Exception as exc:  # noqa: BLE001
+                        print(f"  (aira skipped: {exc})", file=sys.stderr)
+                print(f"  aira: {n_aira} pairs", file=sys.stderr)
+
+            # 3c) Instruct-PTBR-ENUS-11M — large, diverse instruction pool (PT only).
+            #     A real multi-task set; streamed shard by shard until the limit.
+            if args.ptbr11m:
+                files = list_parquet(PTBR11M)
+                got = 0
+                path = os.path.join(tmpdir, "ptbr11m.parquet")
+                for fp in files:
+                    if got >= args.ptbr11m_limit:
+                        break
+                    url = f"https://huggingface.co/datasets/{PTBR11M}/resolve/main/{fp}"
+                    print(f"downloading {fp} ...", file=sys.stderr)
+                    try:
+                        download(url, path)
+                        t = pq.read_table(path, columns=["INSTRUCTION", "RESPONSE",
+                                                         "LANGUAGE"]).to_pydict()
+                        rows = []
+                        for i in range(len(t["INSTRUCTION"])):
+                            if (t["LANGUAGE"][i] or "").lower() not in PT_LANGS:
+                                continue
+                            q = (t["INSTRUCTION"][i] or "").strip()
+                            a = (t["RESPONSE"][i] or "").strip()
+                            if not q or not a:
+                                continue
+                            if args.ptbr11m_max_chars > 0 and len(a) > args.ptbr11m_max_chars:
+                                continue
+                            rows.append(fmt(q, "", a))
+                            if got + len(rows) >= args.ptbr11m_limit:
+                                break
+                        for _ in range(max(1, args.instr_weight)):
+                            random.shuffle(rows)
+                            for ex in rows:
+                                f.write(ex)
+                                written += 1
+                                n_11m += 1
+                        got += len(rows)
+                    except Exception as exc:  # noqa: BLE001
+                        print(f"  (11m shard skipped: {exc})", file=sys.stderr)
+                    finally:
+                        if os.path.exists(path):
+                            os.remove(path)
+                print(f"  instruct-ptbr-11m: {n_11m} pairs", file=sys.stderr)
+
+            # 3d) PCDT — real pt-BR domain QA (health/legal) with explicit answers.
+            if args.pcdt:
+                fp = "data/train-00000-of-00001.parquet"
+                url = f"https://huggingface.co/datasets/{PCDTQA}/resolve/main/{fp}"
+                path = os.path.join(tmpdir, "pcdt.parquet")
+                print("downloading pcdt-qa ...", file=sys.stderr)
+                try:
+                    download(url, path)
+                    t = pq.read_table(path, columns=["questions"]).to_pydict()
+                    rows = []
+                    for qs in t["questions"]:
+                        for qa in (qs or []):
+                            if not isinstance(qa, dict):
+                                continue
+                            q = (qa.get("question") or "").strip()
+                            a = (qa.get("answer") or "").strip()
+                            if not q or not a:
+                                continue
+                            rows.append(fmt(q, "", a))
+                            if args.pcdt_limit and len(rows) >= args.pcdt_limit:
+                                break
+                        if args.pcdt_limit and len(rows) >= args.pcdt_limit:
+                            break
+                    for _ in range(max(1, args.instr_weight)):
+                        random.shuffle(rows)
+                        for ex in rows:
+                            f.write(ex)
+                            written += 1
+                            n_pcdt += 1
+                except Exception as exc:  # noqa: BLE001
+                    print(f"  (pcdt skipped: {exc})", file=sys.stderr)
+                print(f"  pcdt-qa: {n_pcdt} pairs", file=sys.stderr)
+
             # 4) raw Portuguese prose — the *language* stage.  Articles are
             #    streamed row-group by row-group and stop as soon as the char
             #    budget is met, so we never decode the whole (~200 MB) shard in
             #    memory.  Documents are separated by a blank line.
+            #
+            #    The prose budget is tied to the instruction bytes already
+            #    written, so the model always gets a healthy mix (e.g. ratio 3
+            #    -> ~75% prose / 25% instructions) instead of Wikipedia drowning
+            #    everything else out.
+            f.flush()
+            instr_bytes = os.path.getsize(args.out)
+            if args.prose_ratio > 0:
+                budget = int(args.prose_ratio * instr_bytes)
+                if args.wiki_chars > 0:
+                    budget = min(budget, args.wiki_chars)
+            else:
+                budget = args.wiki_chars
+            print(f"  instruction bytes: {instr_bytes / 1048576:.0f} MB "
+                  f"-> prose budget {budget / 1048576:.0f} MB", file=sys.stderr)
             if args.wiki:
                 shards = find_shards(WIKI, args.wiki_config)
                 if not shards:
@@ -476,7 +638,7 @@ def main():
                                     if (len(rows) % 20000) == 0:
                                         print(f"    ... {chars / 1048576:.0f} MB raw",
                                               file=sys.stderr, flush=True)
-                                    if args.wiki_chars and chars >= args.wiki_chars:
+                                    if budget and chars >= budget:
                                         stop = True
                                         break
                                     if args.wiki_limit and len(rows) >= args.wiki_limit:
@@ -488,7 +650,25 @@ def main():
                         except Exception as exc:  # noqa: BLE001
                             print(f"  (wiki shard skipped: {exc})", file=sys.stderr)
                     random.shuffle(rows)
+                    # Hygiene: drop duplicate documents and near-degenerate text
+                    # (little vocabulary relative to length) so the token stream
+                    # is not padded with garbage the model would just memorize.
+                    _seen = set()
+                    _clean = []
                     for tx in rows:
+                        key = hash(" ".join(tx.split())[:512])
+                        if key in _seen:
+                            continue
+                        _seen.add(key)
+                        words = tx.split()
+                        if len(words) < 30:
+                            continue
+                        if len(set(words)) / len(words) < 0.25:
+                            continue
+                        _clean.append(tx)
+                    print(f"  wiki hygiene: {len(rows)} -> {len(_clean)} docs",
+                          file=sys.stderr)
+                    for tx in _clean:
                         f.write("<|text|>\n")
                         f.write(tx)
                         f.write("\n<|end|>\n")
@@ -502,7 +682,17 @@ def main():
     size = os.path.getsize(args.out)
     print(f"wrote {written} examples ({size / 1048576:.2f} MB) to {args.out} "
           f"[chat={n_st} canarim={n_can} alpaca={n_alp} oasst={n_oas} "
-          f"wiki={n_wiki}]", file=sys.stderr)
+          f"aira={n_aira} ptbr11m={n_11m} pcdt={n_pcdt} wiki={n_wiki}]",
+          file=sys.stderr)
+    # Balance report: how much of the token stream is prose vs instruction.  A
+    # healthy mix lets the model both speak the language and follow tasks.
+    instr_bytes = max(0, size - raw_chars)
+    total_bytes = raw_chars + instr_bytes
+    if total_bytes > 0:
+        print(f"balance: prose {raw_chars / 1048576:.0f} MB "
+              f"({100 * raw_chars / total_bytes:.0f}%) | "
+              f"instructions ~{instr_bytes / 1048576:.0f} MB "
+              f"({100 * instr_bytes / total_bytes:.0f}%)", file=sys.stderr)
 
     # Hard corpus check: every chat turn must be complete and paired.  Raw prose
     # has no markers, so a mismatch means the template broke and the run must
