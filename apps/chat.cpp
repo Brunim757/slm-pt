@@ -1,3 +1,5 @@
+#include <chrono>
+#include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -31,7 +33,7 @@ static const char* argval(int argc, char** argv, const char* key, const char* de
 
 int main(int argc, char** argv) {
   const std::string path = argval(argc, argv, "--model", "runs/model.bin");
-  const float temp = std::atof(argval(argc, argv, "--temp", "0.3"));
+  const float temp = std::atof(argval(argc, argv, "--temp", "0.8"));
   const int top_k = std::atoi(argval(argc, argv, "--top-k", "40"));
   const float top_p = std::atof(argval(argc, argv, "--top-p", "0.9"));
   const float rep = std::atof(argval(argc, argv, "--rep", "1.15"));
@@ -66,7 +68,15 @@ int main(int argc, char** argv) {
   std::printf("modelo: %s (embd=%d layer=%d head=%d block=%d)\n\n", path.c_str(),
               cfg.n_embd, cfg.n_layer, cfg.n_head, cfg.block);
 
-  Rng rng(20240521);
+  // Fresh random seed per session by default, so the same question does not
+  // always get the same answer. Override with --seed N for reproducibility.
+  const std::string seed_str = argval(argc, argv, "--seed", "");
+  const uint64_t seed =
+      seed_str.empty()
+          ? static_cast<uint64_t>(
+                std::chrono::steady_clock::now().time_since_epoch().count())
+          : std::strtoull(seed_str.c_str(), nullptr, 10);
+  Rng rng(seed);
   SampleParams sp;
   sp.temperature = temp;
   sp.top_k = top_k;

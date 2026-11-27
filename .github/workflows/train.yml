@@ -187,7 +187,7 @@ jobs:
       - name: Evaluate (held-out perplexity)
         run: |
           ./build/slmpt_eval --model runs/model.bin --ids data/corpus.ids \
-            --data data/corpus.txt --val 0.02 --threads "$(nproc)"
+            --data data/corpus.txt --val 0.02 --threads "$(nproc)" | tee runs/eval.txt
 
       - name: Compression report
         run: |
@@ -203,5 +203,6 @@ jobs:
             runs/model.bin
             runs/model_q.bin
             runs/samples.txt
+            runs/eval.txt
             data/tokenizer.txt
           if-no-files-found: warn
