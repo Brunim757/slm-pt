@@ -16,7 +16,7 @@ on:
         default: "100000"
       max_minutes:
         description: "wall-clock budget (minutes)"
-        default: "330"
+        default: "300"
       examples:
         description: "alpaca pairs limit (0 = all)"
         default: "20000"
@@ -178,18 +178,35 @@ jobs:
             fi
           fi
 
+      - name: Restore tokenizer cache
+        id: tok_cache
+        uses: actions/cache@v4
+        with:
+          path: data/tokenizer.cache.txt
+          # Training BPE is the single most expensive setup step (minutes of CPU
+          # on a large corpus).  It only depends on the BPE code and the target
+          # vocab, so cache it and never retrain the same vocabulary again.
+          key: slmpt-tokenizer-${{ hashFiles('apps/bpe.cpp') }}-v${{ github.event.inputs.bpe_vocab || '8192' }}
+
       - name: Build tokenizer + corpus ids
         run: |
+          BASE=""
           if [ -f data/tokenizer.base.txt ]; then
-            # Resume: freeze the vocabulary so a growing corpus can never change
+            BASE="data/tokenizer.base.txt"        # resume: freeze the checkpoint's vocab
+          elif [ -f data/tokenizer.cache.txt ]; then
+            BASE="data/tokenizer.cache.txt"       # cache: skip the expensive BPE training
+            echo "reusing cached tokenizer (skipping BPE training)"
+          fi
+          if [ -n "$BASE" ]; then
+            # Reuse an existing vocabulary so a growing corpus can never change
             # the token ids (the checkpoint embeds this exact tokenizer).
-            ./build/slmpt_bpe --load data/tokenizer.base.txt \
+            ./build/slmpt_bpe --load "$BASE" \
               --in data/corpus.txt --out data/tokenizer.txt --ids data/corpus.ids
-            cp data/tokenizer.base.txt data/tokenizer.txt
           else
             ./build/slmpt_bpe --in data/corpus.txt --out data/tokenizer.txt \
               --ids data/corpus.ids --vocab "${{ github.event.inputs.bpe_vocab || '8192' }}"
           fi
+          cp data/tokenizer.txt data/tokenizer.cache.txt
 
       - name: Gradient check
         run: ./build/slmpt_gradcheck
@@ -218,7 +235,7 @@ jobs:
             --batch ${{ github.event.inputs.batch || '32' }} \
             --lr ${{ github.event.inputs.lr || '6e-4' }} \
             --steps ${{ github.event.inputs.steps || '100000' }} \
-            --max-minutes ${{ github.event.inputs.max_minutes || '330' }} \
+            --max-minutes ${{ github.event.inputs.max_minutes || '300' }} \
             --save-every 500 --sample-every 500 --threads "$(nproc)" $RESUME
 
       - name: Evaluate (held-out perplexity)
@@ -236,6 +253,7 @@ jobs:
             --threads "$(nproc)"
 
       - name: Upload checkpoint + reports
+        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: kizu-small-run

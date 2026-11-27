@@ -183,7 +183,7 @@ int main(int argc, char** argv) {
   for (const std::string& w : BPETokenizer::pretokenize(freq_text)) freq[w]++;
 
   std::vector<std::pair<std::string, int>> wf(freq.begin(), freq.end());
-  const int max_words = std::atoi(argval(argc, argv, "--max-words", "60000"));
+  const int max_words = std::atoi(argval(argc, argv, "--max-words", "30000"));
   if (max_words > 0 && static_cast<int>(wf.size()) > max_words) {
     std::nth_element(wf.begin(), wf.begin() + max_words, wf.end(),
                      [](const std::pair<std::string, int>& a,
