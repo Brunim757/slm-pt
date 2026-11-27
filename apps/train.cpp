@@ -113,6 +113,7 @@ int main(int argc, char** argv) {
   std::printf("simd: scalar   gemm: tiled broadcast\n");
 #endif
 
+  long base_step = 0;
   if (!cfg.resume.empty()) {
     // Safety lock: a resume is only valid if the tokenizer used to build the
     // checkpoint is byte-identical to ours. Otherwise token ids would decode to
@@ -126,8 +127,9 @@ int main(int argc, char** argv) {
                    cfg.resume.c_str());
       return 2;
     }
-    if (load_checkpoint(model, cfg.resume))
-      std::printf("resumed from %s\n", cfg.resume.c_str());
+    if (load_checkpoint(model, cfg.resume, nullptr, &base_step))
+      std::printf("resumed from %s (global step %ld, optimizer %s)\n", cfg.resume.c_str(),
+                  base_step, base_step > 0 ? "restored" : "cold");
     else
       std::printf("WARN: could not resume from %s (starting fresh)\n", cfg.resume.c_str());
   }
@@ -155,6 +157,7 @@ int main(int argc, char** argv) {
   double last_log = t0;
   int last_step = 0;
   long tokens_seen = 0;
+  long gstep = base_step;  // continues across runs for Adam bias correction
 
   // Optional phase profiling: SLMPT_PROFILE=1 prints where the step time goes.
   const char* prof_env = std::getenv("SLMPT_PROFILE");
@@ -163,6 +166,7 @@ int main(int argc, char** argv) {
   double pf_win = t0;
 
   for (int step = 1; step <= cfg.max_steps; ++step) {
+    ++gstep;
     ds.random_batch(rng, cfg.batch, cfg.block, toks, tgts);
     double w_fwd = 0, w_ce = 0, w_bwd = 0;
     const float loss = prof
@@ -172,8 +176,8 @@ int main(int argc, char** argv) {
     pf_fwd += w_fwd; pf_ce += w_ce; pf_bwd += w_bwd;
 
     float lr = cfg.lr;
-    if (step <= cfg.warmup)
-      lr *= static_cast<float>(step) / cfg.warmup;
+    if (gstep <= cfg.warmup)
+      lr *= static_cast<float>(gstep) / cfg.warmup;
     else {
       float p = 0.f;
       if (cfg.max_minutes > 0) {
@@ -190,7 +194,7 @@ int main(int argc, char** argv) {
     }
     opt.set_lr(lr);
     const double pe = now_s();
-    opt.step(model.params(), step);
+    opt.step(model.params(), static_cast<int>(gstep));
     pf_opt += now_s() - pe;
 
     tokens_seen += (long)cfg.batch * cfg.block;
@@ -230,7 +234,7 @@ int main(int argc, char** argv) {
     }
 
     if (cfg.save_every > 0 && step % cfg.save_every == 0) {
-      save_checkpoint(model, ckpt, tok_blob);
+      save_checkpoint(model, ckpt, tok_blob, gstep);
       std::printf("  [saved] %s\n", ckpt.c_str());
     }
     if ((t - t0) > budget) {
@@ -239,7 +243,7 @@ int main(int argc, char** argv) {
     }
   }
 
-  save_checkpoint(model, ckpt, tok_blob);
+  save_checkpoint(model, ckpt, tok_blob, gstep);
   std::string text = generate(model, tok, probe, sp, rng);
   std::printf("\nfinal sample:\n%s\n", text.c_str());
   std::printf("saved checkpoint: %s\n", ckpt.c_str());

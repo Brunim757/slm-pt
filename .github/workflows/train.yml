@@ -112,7 +112,17 @@ jobs:
       - name: Install python deps
         run: python3 -m pip install --quiet --disable-pip-version-check pyarrow
 
+      - name: Cache corpus text
+        id: corpus_cache
+        uses: actions/cache@v4
+        with:
+          path: data/corpus.txt
+          # Deterministic corpus: same script + same knobs -> same text, so it is
+          # safe to reuse across runs (the token ids are still re-encoded below).
+          key: slmpt-corpus-${{ hashFiles('scripts/fetch_corpus.py') }}-${{ github.event.inputs.wiki || '1' }}-${{ github.event.inputs.wiki_chars || '1500000000' }}-${{ github.event.inputs.examples || '8000' }}-${{ github.event.inputs.alpaca_max_chars || '600' }}-${{ github.event.inputs.canarim_limit || '30000' }}-${{ github.event.inputs.canarim_max_chars || '800' }}-${{ github.event.inputs.chat_weight || '12' }}-${{ github.event.inputs.oasst_weight || '2' }}
+
       - name: Fetch Portuguese corpus
+        if: steps.corpus_cache.outputs.cache-hit != 'true'
         run: |
           python3 scripts/fetch_corpus.py --out data/corpus.txt \
             --limit "${{ github.event.inputs.examples || '8000' }}" \
@@ -123,6 +133,10 @@ jobs:
             --oasst-weight "${{ github.event.inputs.oasst_weight || '2' }}" \
             --wiki "${{ github.event.inputs.wiki || '1' }}" \
             --wiki-chars "${{ github.event.inputs.wiki_chars || '1500000000' }}"
+
+      - name: Note corpus reuse
+        if: steps.corpus_cache.outputs.cache-hit == 'true'
+        run: echo "corpus.txt restored from cache ($(du -h data/corpus.txt | cut -f1))"
 
       - name: Build
         run: |

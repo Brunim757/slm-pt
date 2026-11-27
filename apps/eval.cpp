@@ -54,11 +54,10 @@ int main(int argc, char** argv) {
     std::fprintf(stderr, "cannot load data (tried %s and %s)\n", ids.c_str(), data.c_str());
     return 1;
   }
-  const std::vector<int>& toks = ds.tokens();
-  const size_t n = toks.size();
+  const size_t n = ds.size();
   const size_t val_start = n - static_cast<size_t>(n * val_frac);
   double mean_loss = 0.0;
-  const double ppl = eval_perplexity(model, toks, val_start, n, cfg.block, cfg.block,
+  const double ppl = eval_perplexity(model, ds, val_start, n, cfg.block, cfg.block,
                                      &mean_loss);
   std::printf("model: %s (vocab %d, block %d, params", path.c_str(), cfg.vocab, cfg.block);
   long params = 0;

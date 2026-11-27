@@ -10,10 +10,12 @@ namespace slmpt {
 namespace {
 // v2 magic: RMSNorm + RoPE + SwiGLU architecture, embedded tokenizer.
 const char kMagic[8] = {'S', 'L', 'M', 'P', 'T', '0', '2', '\0'};
+// Marks the optional trailing optimizer section (AdamW m/v + global step).
+const int64_t kOptMarker = 0x534C4F50;  // 'SLO P'
 }  // namespace
 
 bool save_checkpoint(const Model& model, const std::string& path,
-                     const std::string& tokenizer_blob) {
+                     const std::string& tokenizer_blob, long global_step) {
   FILE* f = std::fopen(path.c_str(), "wb");
   if (!f) return false;
   const Config& c = model.config();
@@ -30,6 +32,15 @@ bool save_checkpoint(const Model& model, const std::string& path,
   const int64_t tl = static_cast<int64_t>(tokenizer_blob.size());
   std::fwrite(&tl, sizeof(int64_t), 1, f);
   if (tl > 0) std::fwrite(tokenizer_blob.data(), 1, tokenizer_blob.size(), f);
+  if (global_step >= 0) {
+    const int64_t gs = static_cast<int64_t>(global_step);
+    std::fwrite(&kOptMarker, sizeof(int64_t), 1, f);
+    std::fwrite(&gs, sizeof(int64_t), 1, f);
+    for (Param* p : model.params()) {
+      std::fwrite(p->m.data(), sizeof(float), p->m.size(), f);
+      std::fwrite(p->v.data(), sizeof(float), p->v.size(), f);
+    }
+  }
   std::fclose(f);
   return true;
 }
@@ -105,7 +116,8 @@ bool read_checkpoint_tokenizer(const std::string& path, std::string& out) {
   return true;
 }
 
-bool load_checkpoint(Model& model, const std::string& path, std::string* tokenizer_blob) {
+bool load_checkpoint(Model& model, const std::string& path, std::string* tokenizer_blob,
+                     long* global_step) {
   FILE* f = std::fopen(path.c_str(), "rb");
   if (!f) return false;
   char magic[8];
@@ -136,13 +148,32 @@ bool load_checkpoint(Model& model, const std::string& path, std::string* tokeniz
       return false;
     }
   }
-  if (tokenizer_blob) {
+  if (tokenizer_blob) tokenizer_blob->clear();
+  {
     int64_t tl = 0;
     if (std::fread(&tl, sizeof(int64_t), 1, f) == 1 && tl > 0) {
-      tokenizer_blob->resize(static_cast<size_t>(tl));
-      if (std::fread(&(*tokenizer_blob)[0], 1, static_cast<size_t>(tl), f) !=
-          static_cast<size_t>(tl))
-        tokenizer_blob->clear();
+      if (tokenizer_blob) {
+        tokenizer_blob->resize(static_cast<size_t>(tl));
+        if (std::fread(&(*tokenizer_blob)[0], 1, static_cast<size_t>(tl), f) !=
+            static_cast<size_t>(tl))
+          tokenizer_blob->clear();
+      } else {
+        // Still consume the blob so the optimizer section stays aligned.
+        std::fseek(f, static_cast<long>(tl), SEEK_CUR);
+      }
+    }
+  }
+  if (global_step) *global_step = 0;
+  {
+    int64_t marker = 0;
+    if (std::fread(&marker, sizeof(int64_t), 1, f) == 1 && marker == kOptMarker) {
+      int64_t gs = 0;
+      if (std::fread(&gs, sizeof(int64_t), 1, f) == 1 && global_step)
+        *global_step = static_cast<long>(gs);
+      for (Param* p : model.params()) {
+        if (std::fread(p->m.data(), sizeof(float), p->m.size(), f) != p->m.size()) break;
+        if (std::fread(p->v.data(), sizeof(float), p->v.size(), f) != p->v.size()) break;
+      }
     }
   }
   std::fclose(f);

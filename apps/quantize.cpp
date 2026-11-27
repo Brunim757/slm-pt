@@ -59,12 +59,11 @@ int main(int argc, char** argv) {
     std::fprintf(stderr, "cannot load data\n");
     return 1;
   }
-  const std::vector<int>& toks = ds.tokens();
-  const size_t n = toks.size();
+  const size_t n = ds.size();
   const size_t val_start = n - static_cast<size_t>(n * val_frac);
 
   double loss0 = 0.0;
-  const double ppl0 = eval_perplexity(model, toks, val_start, n, cfg.block, cfg.block,
+  const double ppl0 = eval_perplexity(model, ds, val_start, n, cfg.block, cfg.block,
                                       &loss0);
 
   QuantStats st;
@@ -80,7 +79,7 @@ int main(int argc, char** argv) {
     return 1;
   }
   double loss1 = 0.0;
-  const double ppl1 = eval_perplexity(qmodel, toks, val_start, n, cfg.block, cfg.block,
+  const double ppl1 = eval_perplexity(qmodel, ds, val_start, n, cfg.block, cfg.block,
                                       &loss1);
 
   std::printf("== quantization report ==\n");

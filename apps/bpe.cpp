@@ -1,5 +1,5 @@
 // Train a byte-level BPE tokenizer from scratch (no external libraries) and
-// optionally emit the corpus as int32 token ids.
+// optionally emit the corpus as uint16 token ids.
 //
 //   slmpt_bpe --in data/corpus.txt --out data/tokenizer.txt \
 //             --ids data/corpus.ids --vocab 4096
@@ -10,9 +10,12 @@
 #include <cstdlib>
 #include <cstring>
 #include <string>
+#include <thread>
 #include <unordered_map>
 #include <vector>
 
+#include "slmpt/ids_format.hpp"
+#include "slmpt/parallel.hpp"
 #include "slmpt/tokenizer.hpp"
 
 using namespace slmpt;
@@ -37,6 +40,106 @@ static std::string read_file(const std::string& path, bool& ok) {
   std::fclose(f);
   ok = true;
   return s;
+}
+
+// Encodes `text` to a uint16 ids file, in parallel and streaming: the corpus is
+// cut into newline-aligned segments, each segment is split across threads at
+// newline boundaries (which can never slice a special token), the pieces are
+// encoded concurrently, then written in order.  Only one segment's pieces are
+// ever resident, so even a multi-GB corpus encodes without a matching RAM peak.
+static void write_ids_u16(const BPETokenizer& tok, const std::string& text,
+                          const std::string& path, int nthreads) {
+  FILE* f = std::fopen(path.c_str(), "wb");
+  if (!f) {
+    std::fprintf(stderr, "cannot write %s\n", path.c_str());
+    std::exit(1);
+  }
+  unsigned char hdr[idsfmt::kHeaderBytes] = {0};
+  std::memcpy(hdr, idsfmt::kMagic, 8);
+  const uint32_t dtype = idsfmt::kDtypeU16;
+  std::memcpy(hdr + 8, &dtype, 4);
+  std::fwrite(hdr, 1, sizeof(hdr), f);
+
+  const size_t seg_target = 16u << 20;  // ~16 MB of text per segment
+  const size_t N = text.size();
+  uint64_t total = 0;
+  for (size_t a = 0; a < N;) {
+    size_t b = std::min(N, a + seg_target);
+    if (b < N) {
+      const size_t nl = text.find('\n', b);
+      b = (nl == std::string::npos) ? N : nl + 1;
+    }
+    if (b <= a) b = std::min(N, a + seg_target);
+    const size_t len = b - a;
+
+    int k = nthreads < 1 ? 1 : nthreads;
+    if (len < static_cast<size_t>(k) * 4096) k = std::max(1, static_cast<int>(len / 4096));
+
+    std::vector<size_t> bnd(static_cast<size_t>(k) + 1);
+    bnd[0] = a;
+    bnd[static_cast<size_t>(k)] = b;
+    for (int i = 1; i < k; ++i) {
+      const size_t t = a + len * static_cast<size_t>(i) / static_cast<size_t>(k);
+      size_t p = text.find('\n', t);
+      if (p == std::string::npos || p >= b)
+        p = b;
+      else
+        p += 1;
+      if (p < bnd[static_cast<size_t>(i) - 1]) p = bnd[static_cast<size_t>(i) - 1];
+      bnd[static_cast<size_t>(i)] = p;
+    }
+
+    std::vector<std::vector<int>> parts(static_cast<size_t>(k));
+    parallel_for(k, [&](int p0, int p1) {
+      for (int i = p0; i < p1; ++i)
+        parts[static_cast<size_t>(i)] =
+            tok.encode(text.substr(bnd[static_cast<size_t>(i)],
+                                   bnd[static_cast<size_t>(i) + 1] -
+                                       bnd[static_cast<size_t>(i)]));
+    });
+    for (int i = 0; i < k; ++i) {
+      const std::vector<int>& ids = parts[static_cast<size_t>(i)];
+      std::vector<uint16_t> w(ids.begin(), ids.end());
+      if (!w.empty()) std::fwrite(w.data(), sizeof(uint16_t), w.size(), f);
+      total += w.size();
+      std::vector<int>().swap(parts[static_cast<size_t>(i)]);  // free immediately
+    }
+    a = b;
+  }
+
+  const uint32_t cnt = total > 0xffffffffull ? 0xffffffffu : static_cast<uint32_t>(total);
+  std::fseek(f, 12, SEEK_SET);
+  std::fwrite(&cnt, sizeof(uint32_t), 1, f);
+  std::fclose(f);
+  std::fprintf(stderr, "wrote %s (%llu tokens, uint16, %d threads)\n", path.c_str(),
+               static_cast<unsigned long long>(total), nthreads);
+}
+
+// Streams the ids file back and checks that decoding reproduces `text` exactly.
+static bool verify_roundtrip(const BPETokenizer& tok, const std::string& text,
+                             const std::string& path) {
+  FILE* f = std::fopen(path.c_str(), "rb");
+  if (!f) return false;
+  if (std::fseek(f, idsfmt::kHeaderBytes, SEEK_SET) != 0) {
+    std::fclose(f);
+    return false;
+  }
+  std::vector<uint16_t> blk(1u << 20);
+  std::vector<int> ids;
+  size_t off = 0;
+  bool identical = true;
+  size_t got;
+  while ((got = std::fread(blk.data(), sizeof(uint16_t), blk.size(), f)) > 0) {
+    ids.assign(blk.begin(), blk.begin() + static_cast<long>(got));
+    const std::string d = tok.decode(ids);
+    if (d.size() > text.size() - off || text.compare(off, d.size(), d) != 0) {
+      identical = false;
+      break;
+    }
+    off += d.size();
+  }
+  std::fclose(f);
+  return identical && off == text.size();
 }
 
 int main(int argc, char** argv) {
@@ -170,22 +273,17 @@ int main(int argc, char** argv) {
   std::fprintf(stderr, "wrote %s (vocab %d, %d merges)\n", out.c_str(), tok.vocab_size(),
                tok.n_merges());
 
-  // 3) encode the corpus to int32 ids
+  // 3) encode the corpus to uint16 ids (parallel, streaming)
   if (!ids_out.empty()) {
-    std::vector<int> ids = tok.encode(text);
-    FILE* f = std::fopen(ids_out.c_str(), "wb");
-    if (!f) {
-      std::fprintf(stderr, "cannot write %s\n", ids_out.c_str());
-      return 1;
-    }
-    std::vector<int32_t> buf(ids.begin(), ids.end());
-    std::fwrite(buf.data(), sizeof(int32_t), buf.size(), f);
-    std::fclose(f);
-    std::fprintf(stderr, "wrote %s (%zu tokens, %.2f tokens/byte)\n", ids_out.c_str(),
-                 ids.size(), ids.empty() ? 0.0 : double(ids.size()) / text.size());
-    const std::string back = tok.decode(ids);
-    std::fprintf(stderr, "roundtrip: %s\n", back == text ? "identical" : "MISMATCH");
-    if (back != text) return 1;
+    int nthreads = std::atoi(argval(argc, argv, "--threads", "0"));
+    if (nthreads <= 0)
+      nthreads = static_cast<int>(std::thread::hardware_concurrency());
+    if (nthreads <= 0) nthreads = 1;
+    set_threads(nthreads);
+    write_ids_u16(tok, text, ids_out, nthreads);
+    const bool ok_rt = verify_roundtrip(tok, text, ids_out);
+    std::fprintf(stderr, "roundtrip: %s\n", ok_rt ? "identical" : "MISMATCH");
+    if (!ok_rt) return 1;
   }
   return 0;
 }

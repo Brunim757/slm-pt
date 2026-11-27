@@ -10,13 +10,22 @@
 
 ---
 
-## PRÓXIMO OBJETIVO (anotado, NÃO iniciado)
+## PRÓXIMO OBJETIVO (implementado nesta rodada)
 **Otimização extrema para que o treinamento seja feito de forma ultra-absurda e eficiente.**
 
 Meta: muito mais throughput e capacidade por run, mantendo o modelo único e o resume válido.
-Nada disto deve ser implementado agora — só registro para atacar quando decidirmos.
 
-### Alavancas candidatas (ordem de impacto estimado)
+### Status
+- [x] **(1) Loader** — ids em `uint16` + `mmap` (zero-copy): metade da RAM/disco, sem pico 2x, corpus deixa de ser limitado por RAM.
+- [x] **(2) `mmap`** dos ids — o SO pagina sob demanda.
+- [x] **(3) Encode BPE paralelo** em streaming (segmentos alinhados a `\n`): 50 MB medido em 6,4s → 1,98s (3,2x, 8 threads).
+- [x] **(5) Cache do corpus** entre runs via `actions/cache` (texto cru determinístico).
+- [x] **(6) Resume real do AdamW** — m/v + passo global gravados no checkpoint (retrocompatível com checkpoints antigos).
+- [x] **(8) Inferência** — `dot_f32`/`dot4_f32` com caminho AVX-512 16-wide (antes caíam no AVX2 8-wide).
+- [~] **(4) Kernels de treino** — GEMM/backward já usavam AVX-512; ganho extra de packing/fusão fica para depois (medir antes).
+- [~] **(7) batch/block** — o modelo é *compute-bound* (~74% do pico), batch maior não ajuda; manter 32.
+
+### Alavancas ainda em aberto
 
 1. **Loader de dados — teto de memória (maior ganho de capacidade).**
    Hoje `Dataset::load_ids` carrega tudo como `int32` com pico de 2× (buffer + cópia).

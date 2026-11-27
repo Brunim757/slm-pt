@@ -27,6 +27,14 @@ inline float dot_f32(const float* a, const float* b, int n) {
   float s = vaddvq_f32(acc);
   for (; i < n; ++i) s += a[i] * b[i];
   return s;
+#elif defined(__AVX512F__)
+  __m512 acc = _mm512_setzero_ps();
+  int i = 0;
+  for (; i + 16 <= n; i += 16)
+    acc = _mm512_fmadd_ps(_mm512_loadu_ps(a + i), _mm512_loadu_ps(b + i), acc);
+  float s = _mm512_reduce_add_ps(acc);
+  for (; i < n; ++i) s += a[i] * b[i];
+  return s;
 #elif defined(__AVX2__)
   __m256 acc = _mm256_setzero_ps();
   int i = 0;
@@ -62,6 +70,23 @@ inline void dot4_f32(const float* x, const float* w0, const float* w1,
   }
   float s0 = vaddvq_f32(a0), s1 = vaddvq_f32(a1);
   float s2 = vaddvq_f32(a2), s3 = vaddvq_f32(a3);
+  for (; i < n; ++i) {
+    const float xv = x[i];
+    s0 += xv * w0[i]; s1 += xv * w1[i]; s2 += xv * w2[i]; s3 += xv * w3[i];
+  }
+  out[0] = s0; out[1] = s1; out[2] = s2; out[3] = s3;
+#elif defined(__AVX512F__)
+  __m512 a0 = _mm512_setzero_ps(), a1 = a0, a2 = a0, a3 = a0;
+  int i = 0;
+  for (; i + 16 <= n; i += 16) {
+    const __m512 xv = _mm512_loadu_ps(x + i);
+    a0 = _mm512_fmadd_ps(xv, _mm512_loadu_ps(w0 + i), a0);
+    a1 = _mm512_fmadd_ps(xv, _mm512_loadu_ps(w1 + i), a1);
+    a2 = _mm512_fmadd_ps(xv, _mm512_loadu_ps(w2 + i), a2);
+    a3 = _mm512_fmadd_ps(xv, _mm512_loadu_ps(w3 + i), a3);
+  }
+  float s0 = _mm512_reduce_add_ps(a0), s1 = _mm512_reduce_add_ps(a1);
+  float s2 = _mm512_reduce_add_ps(a2), s3 = _mm512_reduce_add_ps(a3);
   for (; i < n; ++i) {
     const float xv = x[i];
     s0 += xv * w0[i]; s1 += xv * w1[i]; s2 += xv * w2[i]; s3 += xv * w3[i];
