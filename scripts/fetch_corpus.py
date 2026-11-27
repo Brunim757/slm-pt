@@ -95,9 +95,22 @@ def find_shards(dataset, config):
     return []
 
 
-def download(url, path):
-    with open_url(url) as r, open(path, "wb") as f:
-        shutil.copyfileobj(r, f, length=1 << 20)
+def download(url, path, timeout=600):
+    """Download with a hard timeout + retries (falls back to urllib).
+
+    urllib has no whole-transfer timeout, so a stalled connection can hang the
+    job forever; curl's --max-time bounds it.
+    """
+    try:
+        import subprocess
+        subprocess.run(
+            ["curl", "-sSL", "--fail", "--max-time", str(timeout),
+             "--retry", "3", "--retry-delay", "2", "-o", path, url],
+            check=True, timeout=timeout + 60)
+        return
+    except Exception:  # noqa: BLE001
+        with open_url(url, timeout=timeout) as r, open(path, "wb") as f:
+            shutil.copyfileobj(r, f, length=1 << 20)
 
 
 def fmt(instr, inp, out):
@@ -449,7 +462,7 @@ def main():
                         if stop:
                             break
                         url = f"https://huggingface.co/datasets/{WIKI}/resolve/main/{shard}"
-                        print(f"downloading {shard} ...", file=sys.stderr)
+                        print(f"downloading {shard} ...", file=sys.stderr, flush=True)
                         try:
                             download(url, path)
                             for batch in pq.ParquetFile(path).iter_batches(
@@ -460,6 +473,9 @@ def main():
                                         continue
                                     rows.append(tx)
                                     chars += len(tx)
+                                    if (len(rows) % 20000) == 0:
+                                        print(f"    ... {chars / 1048576:.0f} MB raw",
+                                              file=sys.stderr, flush=True)
                                     if args.wiki_chars and chars >= args.wiki_chars:
                                         stop = True
                                         break
