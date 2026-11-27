@@ -82,10 +82,6 @@ permissions:
   contents: read
   actions: read
 
-concurrency:
-  group: train
-  cancel-in-progress: false
-
 jobs:
   train:
     runs-on: ubuntu-latest
