@@ -46,13 +46,13 @@ on:
         default: "8192"
       embd:
         description: "embedding dim"
-        default: "448"
+        default: "384"
       layer:
         description: "number of layers"
-        default: "11"
+        default: "7"
       head:
         description: "attention heads"
-        default: "7"
+        default: "6"
       block:
         description: "context length"
         default: "512"
@@ -166,7 +166,7 @@ jobs:
             # Only resume a checkpoint whose architecture matches the configured
             # one. A different n_embd/vocab would silently fail to load, and worse,
             # its frozen tokenizer would be copied and used to train the new model.
-            WANT="embd=${{ github.event.inputs.embd || '448' }} layer=${{ github.event.inputs.layer || '11' }} head=${{ github.event.inputs.head || '7' }} block=${{ github.event.inputs.block || '512' }} vocab=${{ github.event.inputs.bpe_vocab || '8192' }}"
+            WANT="embd=${{ github.event.inputs.embd || '384' }} layer=${{ github.event.inputs.layer || '7' }} head=${{ github.event.inputs.head || '6' }} block=${{ github.event.inputs.block || '512' }} vocab=${{ github.event.inputs.bpe_vocab || '8192' }}"
             PREV_ARCH="$(find /tmp/prev -name arch.txt -print -quit | xargs -r cat 2>/dev/null | tr -d '\n' || true)"
             if [ "$PREV_ARCH" = "$WANT" ]; then
               PREV="$(find /tmp/prev -name model.bin -print -quit)"
@@ -228,9 +228,9 @@ jobs:
           if [ -f runs/model.bin ]; then RESUME="--resume runs/model.bin"; fi
           ./build/slmpt_train --data data/corpus.txt --ids data/corpus.ids \
             --tokenizer data/tokenizer.txt --out runs \
-            --embd ${{ github.event.inputs.embd || '448' }} \
-            --layer ${{ github.event.inputs.layer || '11' }} \
-            --head ${{ github.event.inputs.head || '7' }} \
+            --embd ${{ github.event.inputs.embd || '384' }} \
+            --layer ${{ github.event.inputs.layer || '7' }} \
+            --head ${{ github.event.inputs.head || '6' }} \
             --block ${{ github.event.inputs.block || '512' }} \
             --batch ${{ github.event.inputs.batch || '32' }} \
             --lr ${{ github.event.inputs.lr || '6e-4' }} \

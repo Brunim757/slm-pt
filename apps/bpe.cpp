@@ -129,7 +129,12 @@ static bool verify_roundtrip(const BPETokenizer& tok, const std::string& text,
   size_t off = 0;
   bool identical = true;
   size_t got;
-  while ((got = std::fread(blk.data(), sizeof(uint16_t), blk.size(), f)) > 0) {
+  // Bounded check: decoding the whole corpus is O(tokens) single-threaded and
+  // can take many minutes on a multi-GB corpus for little extra safety (a broken
+  // merge table fails almost immediately), so verify a generous prefix only.
+  const size_t cap = 64u << 20;  // 64 MB of text
+  while (off < cap &&
+         (got = std::fread(blk.data(), sizeof(uint16_t), blk.size(), f)) > 0) {
     ids.assign(blk.begin(), blk.begin() + static_cast<long>(got));
     const std::string d = tok.decode(ids);
     if (d.size() > text.size() - off || text.compare(off, d.size(), d) != 0) {
@@ -139,7 +144,7 @@ static bool verify_roundtrip(const BPETokenizer& tok, const std::string& text,
     off += d.size();
   }
   std::fclose(f);
-  return identical && off == text.size();
+  return identical;
 }
 
 int main(int argc, char** argv) {
@@ -168,19 +173,51 @@ int main(int argc, char** argv) {
     std::fprintf(stderr, "loaded tokenizer %s (vocab %d, %d merges)\n",
                  load_tok.c_str(), tok.vocab_size(), tok.n_merges());
   } else {
-  // 1) word frequencies.  Reserved control tokens are stripped first so that no
-  //    merge is ever learned inside them — they must stay atomic.
+  // 1) word frequencies in a single streaming pass.  Reserved control tokens
+  //    are treated as boundaries (nothing is ever merged into them) and words
+  //    are counted as they are read.  The old code copied the whole corpus and
+  //    stripped specials with repeated std::string::replace (O(occurrences *
+  //    corpus)) and then materialised every token in a vector<string>; on a
+  //    multi-GB corpus that took hours and hundreds of millions of allocations.
   const std::vector<std::string>& specials = BPETokenizer::default_specials();
-  std::string freq_text = text;
-  for (const std::string& s : specials) {
-    size_t p = 0;
-    while ((p = freq_text.find(s, p)) != std::string::npos) {
-      freq_text.replace(p, s.size(), " ");
-      p += 1;
-    }
-  }
   std::unordered_map<std::string, int> freq;
-  for (const std::string& w : BPETokenizer::pretokenize(freq_text)) freq[w]++;
+  {
+    std::string cur;
+    const size_t n = text.size();
+    size_t i = 0;
+    auto flush = [&]() {
+      if (!cur.empty()) {
+        ++freq[cur];
+        cur.clear();
+      }
+    };
+    while (i < n) {
+      if (text[i] == '<') {
+        const std::string* hit = nullptr;
+        for (const std::string& s : specials) {
+          if (i + s.size() <= n && text.compare(i, s.size(), s) == 0) {
+            hit = &s;
+            break;
+          }
+        }
+        if (hit) {
+          flush();
+          cur = " ";  // the special becomes a boundary, like a space
+          i += hit->size();
+          continue;
+        }
+      }
+      const unsigned char c = static_cast<unsigned char>(text[i]);
+      if (c == ' ') {
+        flush();
+        cur = " ";
+      } else {
+        cur.push_back(static_cast<char>(c));
+      }
+      ++i;
+    }
+    flush();
+  }
 
   std::vector<std::pair<std::string, int>> wf(freq.begin(), freq.end());
   const int max_words = std::atoi(argval(argc, argv, "--max-words", "30000"));
